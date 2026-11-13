@@ -224,6 +224,10 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   /// macOS aborts pairing, dropping the peripheral seconds after it connects.
   private var pendingPairs: [String: IOBluetoothDevicePair] = [:]
 
+  /// Status labels shown in the keyboard PIN prompt while pairing completes.
+  /// The Bluetooth pairing API reports the final result, not individual keys.
+  private var keyboardPairingPromptStatuses: [String: NSTextField] = [:]
+
   /// The attempt token each pending pair was created under, maintained in
   /// lockstep with `pendingPairs`. The delegate must fail with the *pair's
   /// own* token — reading the address's current token at callback time would
@@ -1841,6 +1845,8 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
         }
         if device.isConnected() {
           self.setConnectionState(.connected, for: address)
+          self.setKeyboardPairingPromptStatus(
+            String(localized: "Connected. The pairing code was accepted."), for: address)
           self.registerForDisconnect(device: device, address: address)
         } else if let attempt {
           let name = device.resolvedName
@@ -1898,10 +1904,12 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
 
     DispatchQueue.main.async { [weak self] in
       guard let self = self, self.pendingPairs[address] === pair else { return }
+      let deviceName = device.name ?? BluetoothPeripheral.unknownName
+      guard Self.requiresManualKeyboardPIN(deviceName: deviceName) else { return }
       Log.bluetooth.notice("Bluetooth passkey entry requested for \(address)")
       self.showKeyboardPairingPrompt(
         code: String(format: "%06u", passkey),
-        deviceName: device.name ?? BluetoothPeripheral.unknownName,
+        deviceName: deviceName,
         address: address,
         pair: pair)
     }
@@ -1929,8 +1937,37 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     alert.alertStyle = .informational
     alert.addButton(withTitle: String(localized: "Done"))
 
+    let status = NSTextField(
+      labelWithString: String(localized: "Waiting for the keyboard to finish pairing…"))
+    status.lineBreakMode = .byWordWrapping
+    status.maximumNumberOfLines = 2
+    alert.accessoryView = status
+    keyboardPairingPromptStatuses[address] = status
+
     NSApp.activate(ignoringOtherApps: true)
     alert.runModal()
+    if keyboardPairingPromptStatuses[address] === status {
+      keyboardPairingPromptStatuses.removeValue(forKey: address)
+    }
+  }
+
+  private func setKeyboardPairingPromptStatus(_ message: String, for address: String) {
+    let update: () -> Void = { [weak self] in
+      guard let status = self?.keyboardPairingPromptStatuses[address] else { return }
+      status.stringValue = message
+    }
+    if Thread.isMainThread {
+      update()
+    } else {
+      DispatchQueue.main.async(execute: update)
+    }
+  }
+
+  /// Only the legacy Apple Wireless Keyboard needs a human to type the code
+  /// on the peripheral. Other devices keep their existing automatic pairing
+  /// behavior, even if they request a PIN through this delegate.
+  static func requiresManualKeyboardPIN(deviceName: String) -> Bool {
+    deviceName.localizedCaseInsensitiveContains("Apple Wireless Keyboard")
   }
 
   @objc func devicePairingPINCodeRequest(_ sender: Any!) {
@@ -1956,9 +1993,11 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
         for (index, byte) in digits.enumerated() { raw[index] = byte }
       }
       pair.replyPINCode(digits.count, pinCode: &code)
+      let deviceName = pair.device()?.name ?? BluetoothPeripheral.unknownName
+      guard Self.requiresManualKeyboardPIN(deviceName: deviceName) else { return }
       self.showKeyboardPairingPrompt(
         code: pin,
-        deviceName: pair.device()?.name ?? BluetoothPeripheral.unknownName,
+        deviceName: deviceName,
         address: address,
         pair: pair)
     }
@@ -2109,6 +2148,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       // quiet.
       let bondWasReset = self.consumeBondAwaitingRepair(id)
       self.setConnectionState(.disconnected, for: id)
+      self.setKeyboardPairingPromptStatus(inline, for: id)
       guard announce || bondWasReset else { return }
       self.setPeripheralError(bondWasReset ? String(localized: "Pairing reset.") : inline, for: id)
       guard notify else { return }
