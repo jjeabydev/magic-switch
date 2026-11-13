@@ -1913,6 +1913,11 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
           "Ignoring passkey prompt for \(address); registered device is not a keyboard")
         return
       }
+      guard self.shouldPresentKeyboardPairingPrompt(address: address) else {
+        Log.bluetooth.notice(
+          "Suppressing passkey prompt for \(address): pairing attempt is not interactive")
+        return
+      }
       let deviceName = self.pairingDisplayName(address: address, reportedName: reportedName)
       Log.bluetooth.notice("Bluetooth passkey entry requested for \(address)")
       self.showKeyboardPairingPrompt(
@@ -1948,7 +1953,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     alert.addButton(withTitle: String(localized: "Done"))
 
     let codeLabel = NSTextField(labelWithString: code)
-    codeLabel.font = .monospacedDigitSystemFont(ofSize: 34, weight: .semibold)
+    codeLabel.font = .monospacedDigitSystemFont(ofSize: 26, weight: .semibold)
     codeLabel.alignment = .center
     codeLabel.textColor = .labelColor
     codeLabel.setAccessibilityLabel(String(localized: "Bluetooth pairing code: \(code)"))
@@ -1958,11 +1963,21 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     status.lineBreakMode = .byWordWrapping
     status.maximumNumberOfLines = 2
 
+    // Keep the accessory narrower than the alert's content area so the code
+    // and instructions remain visible on smaller displays and with larger
+    // accessibility text settings.
     let accessory = NSStackView(views: [codeLabel, status])
     accessory.orientation = .vertical
     accessory.alignment = .centerX
     accessory.spacing = 8
     accessory.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 8, right: 12)
+    accessory.translatesAutoresizingMaskIntoConstraints = false
+    status.preferredMaxLayoutWidth = 280
+    NSLayoutConstraint.activate([
+      accessory.widthAnchor.constraint(equalToConstant: 304),
+      codeLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 280),
+      status.widthAnchor.constraint(equalToConstant: 280),
+    ])
     alert.accessoryView = accessory
     keyboardPairingPromptStatuses[address] = status
     keyboardPairingPromptWindows[address] = alert.window
@@ -2011,6 +2026,13 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     return peripheralType(for: peripheral) == .keyboard
   }
 
+  /// Only an explicit connect or handoff should ask the user to type on the
+  /// keyboard. Watcher retries run unattended and must not open a modal on the
+  /// Mac that is releasing the peripheral.
+  private func shouldPresentKeyboardPairingPrompt(address: String) -> Bool {
+    pairTimeoutShouldAnnounce[address] == true
+  }
+
   private func pairingDisplayName(address: String, reportedName: String?) -> String {
     if let peripheral = peripherals.first(where: { $0.id == address }) { return peripheral.name }
     if let reportedName, !reportedName.isEmpty { return reportedName }
@@ -2049,6 +2071,11 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       }
       pair.replyPINCode(digits.count, pinCode: &code)
       guard requiresManualPIN else { return }
+      guard self.shouldPresentKeyboardPairingPrompt(address: address) else {
+        Log.bluetooth.notice(
+          "Suppressing PIN prompt for \(address): pairing attempt is not interactive")
+        return
+      }
       self.showKeyboardPairingPrompt(
         code: pin,
         deviceName: deviceName,
