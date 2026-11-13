@@ -1904,8 +1904,13 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
 
     DispatchQueue.main.async { [weak self] in
       guard let self = self, self.pendingPairs[address] === pair else { return }
-      let deviceName = device.name ?? BluetoothPeripheral.unknownName
-      guard Self.requiresManualKeyboardPIN(deviceName: deviceName) else { return }
+      let reportedName = device.name
+      guard self.requiresManualKeyboardPIN(address: address, reportedName: reportedName) else {
+        Log.bluetooth.notice(
+          "Ignoring passkey prompt for \(address); registered device is not a keyboard")
+        return
+      }
+      let deviceName = self.pairingDisplayName(address: address, reportedName: reportedName)
       Log.bluetooth.notice("Bluetooth passkey entry requested for \(address)")
       self.showKeyboardPairingPrompt(
         code: String(format: "%06u", passkey),
@@ -1933,12 +1938,14 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       format: String(
         localized: "Type this code on %@, then press Return on the keyboard."),
       deviceName)
-    alert.informativeText = "\(instructions)\n\n\(code)"
+    let noKeystrokeEcho = String(
+      localized: "The digits won't appear here; this window shows the pairing result.")
+    alert.informativeText = "\(instructions)\n\n\(code)\n\n\(noKeystrokeEcho)"
     alert.alertStyle = .informational
     alert.addButton(withTitle: String(localized: "Done"))
 
     let status = NSTextField(
-      labelWithString: String(localized: "Waiting for the keyboard to finish pairing…"))
+      labelWithString: String(localized: "The keyboard is waiting for the code."))
     status.lineBreakMode = .byWordWrapping
     status.maximumNumberOfLines = 2
     alert.accessoryView = status
@@ -1963,11 +1970,23 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     }
   }
 
-  /// Only the legacy Apple Wireless Keyboard needs a human to type the code
-  /// on the peripheral. Other devices keep their existing automatic pairing
-  /// behavior, even if they request a PIN through this delegate.
+  /// Matches the legacy Apple Wireless Keyboard when macOS reports its model
+  /// name. The registered peripheral type is also checked below because the
+  /// reported name can be empty or customized.
   static func requiresManualKeyboardPIN(deviceName: String) -> Bool {
     deviceName.localizedCaseInsensitiveContains("Apple Wireless Keyboard")
+  }
+
+  private func requiresManualKeyboardPIN(address: String, reportedName: String?) -> Bool {
+    if let reportedName, Self.requiresManualKeyboardPIN(deviceName: reportedName) { return true }
+    guard let peripheral = peripherals.first(where: { $0.id == address }) else { return false }
+    return peripheralType(for: peripheral) == .keyboard
+  }
+
+  private func pairingDisplayName(address: String, reportedName: String?) -> String {
+    if let peripheral = peripherals.first(where: { $0.id == address }) { return peripheral.name }
+    if let reportedName, !reportedName.isEmpty { return reportedName }
+    return BluetoothPeripheral.unknownName
   }
 
   @objc func devicePairingPINCodeRequest(_ sender: Any!) {
@@ -1982,19 +2001,26 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
         Log.bluetooth.notice("Ignoring Bluetooth PIN code request for \(address): not our pairing")
         return
       }
-      Log.bluetooth.notice("Replying to Bluetooth PIN code request for \(address)")
-      // Legacy HID peripherals with no keypad take the all-zero PIN. The
-      // user must also enter that PIN on keyboards that request device-side
-      // entry, as Apple documents for this delegate callback.
-      let pin = "0000"
+      let reportedName = pair.device()?.name
+      let requiresManualPIN = self.requiresManualKeyboardPIN(
+        address: address, reportedName: reportedName)
+      let deviceName = self.pairingDisplayName(address: address, reportedName: reportedName)
+      Log.bluetooth.notice(
+        "Replying to Bluetooth PIN code request for \(address) "
+          + "(manual keyboard prompt: \(requiresManualPIN))")
+      // Devices without a keypad commonly use the all-zero PIN. An Apple
+      // Wireless Keyboard accepts a user-entered PIN, so give it the same
+      // six-digit flow as normal macOS pairing and reply with that exact code.
+      let pin = requiresManualPIN
+        ? String(format: "%06d", Int.random(in: 0..<1_000_000))
+        : "0000"
       var code = BluetoothPINCode()
       let digits = Array(pin.utf8)
       withUnsafeMutableBytes(of: &code.data) { raw in
         for (index, byte) in digits.enumerated() { raw[index] = byte }
       }
       pair.replyPINCode(digits.count, pinCode: &code)
-      let deviceName = pair.device()?.name ?? BluetoothPeripheral.unknownName
-      guard Self.requiresManualKeyboardPIN(deviceName: deviceName) else { return }
+      guard requiresManualPIN else { return }
       self.showKeyboardPairingPrompt(
         code: pin,
         deviceName: deviceName,
