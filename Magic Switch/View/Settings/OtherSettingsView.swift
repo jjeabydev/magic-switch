@@ -1,0 +1,464 @@
+import ServiceManagement
+import SwiftUI
+
+/// View responsible for displaying and managing miscellaneous application settings
+struct OtherSettingsView: View {
+  // MARK: - Properties
+
+  @Environment(\.openURL) private var openURL
+  @ObservedObject private var updateChecker = UpdateChecker.shared
+  @ObservedObject private var bluetoothTransport = BLETransport.shared
+  @ObservedObject private var displayMonitor = DisplayMonitor.shared
+  @ObservedObject private var hotkey = HotkeyManager.shared
+  @State private var launchAtLogin: Bool = false
+  @State private var notificationsDenied: Bool = false
+  @AppStorage(BluetoothPeripheralStore.releaseOnSleepDefaultsKey)
+  private var releaseOnSleep: Bool = true
+  @AppStorage(BluetoothPeripheralStore.autoReconnectDefaultsKey)
+  private var autoReconnect: Bool = true
+
+  // MARK: - View Content
+
+  /// Form content containing setting options
+  private var formContent: some View {
+    Form {
+      if notificationsDenied {
+        Section {
+          // Failure feedback (cancelled switches, identity mismatches) only
+          // arrives via notifications, so a denied permission means silent
+          // failures — worth flagging where the user can act on it.
+          Label(
+            "Notifications are off, so you won't hear when a switch fails. Enable them for Magic Switch in System Settings → Notifications.",
+            systemImage: "bell.slash"
+          )
+          .font(.callout)
+          .foregroundColor(.secondary)
+        }
+      }
+      Section(header: Text("General")) {
+        if #available(macOS 13.0, *) {
+          Toggle("Open at Login", isOn: $launchAtLogin)
+            .onChange(of: launchAtLogin, perform: setLaunchAtLogin)
+            .help("Start Magic Switch automatically when you log in to this Mac.")
+        }
+        Toggle(
+          "Connect over Bluetooth when the network can't",
+          isOn: Binding(
+            get: { bluetoothTransport.isEnabled },
+            set: { bluetoothTransport.setEnabled($0) }
+          )
+        )
+        .help(
+          "Reach your other Mac over Bluetooth when the network can't carry the connection. Turn it on for both Macs. Magic Switch goes back to the network as soon as it works again."
+        )
+        if bluetoothTransport.isEnabled, let problem = bluetoothRadioProblem {
+          Label(problem, systemImage: "exclamationmark.triangle.fill")
+            .font(.callout)
+            .foregroundColor(.secondary)
+        }
+      }
+      Section(header: Text("Peripheral Handling")) {
+        Toggle("Release peripherals when this Mac sleeps", isOn: $releaseOnSleep)
+          .help(
+            "Release the peripherals just before this Mac sleeps so your other Mac can take them. Turn off to keep them paired with this Mac while it sleeps."
+          )
+        Toggle("Reconnect peripherals if they drop", isOn: $autoReconnect)
+          .help(
+            "Keep trying for up to 10 minutes to reconnect a peripheral that dropped from this Mac, and take over the ones your other Mac leaves behind when it sleeps. Never takes a peripheral your other Mac is using."
+          )
+      }
+      Section(header: Text("Keyboard Shortcuts")) {
+        ShortcutRecorderRow(
+          direction: .send,
+          title: String(localized: "Send peripherals to the other Mac"),
+          help:
+            String(
+              localized:
+                "Click to record a shortcut. Pressing it anywhere in macOS sends every registered peripheral to the other Mac."
+            )
+        )
+        ShortcutRecorderRow(
+          direction: .take,
+          title: String(localized: "Take peripherals to this Mac"),
+          help:
+            String(
+              localized:
+                "Click to record a shortcut. Pressing it anywhere in macOS takes every registered peripheral to this Mac, even while the other Mac is asleep."
+            )
+        )
+        ShortcutRecorderRow(
+          direction: .toggle,
+          title: String(localized: "Toggle peripherals between Macs"),
+          help:
+            String(
+              localized:
+                "Click to record a shortcut. Pressing it anywhere in macOS moves the peripherals to whichever Mac doesn't have them, like clicking the other Mac in the menu."
+            )
+        )
+      }
+      Section {
+        if displayRows.isEmpty {
+          Text("No external displays connected.")
+            .foregroundColor(.secondary)
+            .help("Connect a display to this Mac and it will appear here.")
+        } else {
+          ForEach(displayRows) { row in
+            displayRow(for: row)
+          }
+        }
+      } header: {
+        HStack {
+          Text("Take Peripherals When a Display Connects")
+            .help(
+              "Mark a display and your peripherals switch to this Mac whenever it connects."
+            )
+          Spacer()
+          Button(action: { displayMonitor.refreshNow() }) {
+            Image(systemName: "arrow.clockwise")
+          }
+          .buttonStyle(.borderless)
+          .help("Re-scan the displays connected to this Mac.")
+          .accessibilityLabel("Refresh connected displays")
+        }
+      }
+      Section(header: Text("About")) {
+        SettingsRowView(
+          title: String(localized: "License Information"),
+          help: String(localized: "Open the project license in your browser."),
+          action: showLicenseInfo
+        )
+        #if !APP_STORE
+          SettingsRowView(
+            title: String(localized: "Sponsor on GitHub"),
+            help: String(
+              localized:
+                "Support Magic Switch's development. Opens GitHub Sponsors in your browser."),
+            action: openSponsorPage
+          )
+        #endif
+        HStack {
+          Text("Version")
+          Spacer()
+          #if !APP_STORE
+            updateStatus
+          #endif
+          Text(updateChecker.currentVersion)
+            .foregroundColor(.secondary)
+          if updateChecker.updateAvailable, let latest = updateChecker.latestVersion {
+            Button(action: openLatestRelease) {
+              HStack(spacing: 5) {
+                Image(systemName: "arrow.up")
+                  .font(.system(size: 11, weight: .semibold))
+                Text(latest)
+              }
+              .padding(.horizontal, 11)
+              .padding(.vertical, 5)
+              .background(Capsule().fill(Color.secondary.opacity(0.22)))
+              .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .help(
+              "A newer version of Magic Switch is available. Opens the release page in your browser."
+            )
+            .accessibilityLabel(String(localized: "Update to version \(latest) available"))
+          }
+          #if !APP_STORE
+            Button {
+              updateChecker.checkNow()
+            } label: {
+              Group {
+                if updateChecker.isChecking {
+                  ProgressView()
+                    .controlSize(.small)
+                } else {
+                  Image(systemName: "arrow.triangle.2.circlepath")
+                    .foregroundColor(.secondary)
+                }
+              }
+              .frame(width: 16, height: 16)
+            }
+            .buttonStyle(.borderless)
+            .disabled(updateChecker.isChecking)
+            .help("Check GitHub for a newer release right now.")
+            .accessibilityLabel("Check for Updates")
+          #endif
+        }
+      }
+    }
+    .onAppear(perform: refreshOnAppear)
+    .onDisappear { hotkey.cancelRecording() }
+  }
+
+  var body: some View {
+    if #available(macOS 13.0, *) {
+      formContent
+        .formStyle(.grouped)
+    } else {
+      // Plain (non-grouped) Forms don't scroll on their own, and the tab now
+      // holds more rows than the fixed Settings window shows at once.
+      ScrollView {
+        formContent
+          .padding()
+      }
+    }
+  }
+
+  // MARK: - Display Trigger Rows
+
+  /// A row in the display-trigger list: a connected external display, or one
+  /// remembered as a trigger while disconnected.
+  private struct DisplayRow: Identifiable {
+    let id: String
+    let name: String
+    let isConnected: Bool
+  }
+
+  /// Connected external displays first (already name-sorted by the monitor),
+  /// then remembered trigger displays that aren't currently connected —
+  /// still labeled, removable with their trash button.
+  private var displayRows: [DisplayRow] {
+    let connected = displayMonitor.connectedDisplays.map {
+      DisplayRow(id: $0.id, name: $0.name, isConnected: true)
+    }
+    let connectedIDs = Set(connected.map { $0.id })
+    let remembered = displayMonitor.triggerDisplays
+      .filter { !connectedIDs.contains($0.key) }
+      .map { DisplayRow(id: $0.key, name: $0.value, isConnected: false) }
+      .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    return connected + remembered
+  }
+
+  /// A connected display gets the trigger toggle; a remembered-but-
+  /// disconnected one gets a trash button instead — with nothing to toggle
+  /// *to* (unmarking is forgetting; the trigger map is the only memory),
+  /// a toggle would just be a remove control in disguise.
+  @ViewBuilder
+  private func displayRow(for row: DisplayRow) -> some View {
+    if row.isConnected {
+      Toggle(row.name, isOn: triggerBinding(for: row))
+        .help(
+          "Switch your peripherals to this Mac whenever \(row.name) connects. Display ID: \(row.id)."
+        )
+    } else {
+      HStack {
+        VStack(alignment: .leading, spacing: 2) {
+          Text(row.name)
+          Text("Not connected")
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+        .help(
+          "\(row.name) isn't connected right now. It still triggers the switch when it next connects. Display ID: \(row.id)."
+        )
+        Spacer()
+        Button(action: { displayMonitor.setTriggerEnabled(false, id: row.id, name: row.name) }) {
+          Image(systemName: "trash")
+            .foregroundColor(.red)
+        }
+        .help("Forget \(row.name) — it will no longer trigger a switch when it connects.")
+        .accessibilityLabel("Forget \(row.name)")
+      }
+    }
+  }
+
+  private func triggerBinding(for row: DisplayRow) -> Binding<Bool> {
+    Binding(
+      get: { displayMonitor.triggerDisplays[row.id] != nil },
+      set: { displayMonitor.setTriggerEnabled($0, id: row.id, name: row.name) }
+    )
+  }
+
+  /// Why the enabled Bluetooth transport can't run right now, if it can't.
+  private var bluetoothRadioProblem: String? {
+    switch bluetoothTransport.radioState {
+    case .poweredOff:
+      return String(
+        localized:
+          "Bluetooth is off. Turn it on in Control Center to reach your other Mac this way.")
+    case .unauthorized:
+      return String(
+        localized:
+          "Magic Switch isn't allowed to use Bluetooth. Allow it in System Settings → Privacy & Security → Bluetooth."
+      )
+    case .unsupported:
+      return String(localized: "This Mac doesn't support Bluetooth Low Energy.")
+    default:
+      return nil
+    }
+  }
+
+  /// Trailing status beside the Check-for-Updates button. The "Update
+  /// Available" row already covers the positive case, so this only reports a
+  /// failed manual check or an up-to-date result.
+  @ViewBuilder
+  private var updateStatus: some View {
+    if updateChecker.lastCheckFailed {
+      Text("Couldn't check")
+        .font(.caption)
+        .foregroundColor(.red)
+    } else if !updateChecker.isChecking, !updateChecker.updateAvailable,
+      updateChecker.latestVersion != nil
+    {
+      Text("Up to date")
+        .font(.caption)
+        .foregroundColor(.secondary)
+    }
+  }
+
+  // MARK: - Private Methods
+
+  private func showLicenseInfo() {
+    guard let url = URL(string: "https://github.com/MegaManSec/magic-switch/blob/main/LICENSE")
+    else { return }
+    openURL(url)
+  }
+
+  private func openSponsorPage() {
+    guard let url = URL(string: "https://github.com/sponsors/MegaManSec") else { return }
+    openURL(url)
+  }
+
+  private func openLatestRelease() {
+    guard let url = updateChecker.releasePageURL else { return }
+    openURL(url)
+  }
+
+  /// Refresh launch-at-login state, the display list, and nudge the update
+  /// check. `checkIfNeeded` respects the 24h cadence, so opening Settings
+  /// rarely fires a real request.
+  private func refreshOnAppear() {
+    refreshLaunchAtLogin()
+    displayMonitor.refreshNow()
+    updateChecker.checkIfNeeded()
+    NotificationManager.checkAuthorizationDenied { notificationsDenied = $0 }
+  }
+
+  private func refreshLaunchAtLogin() {
+    if #available(macOS 13.0, *) {
+      launchAtLogin = (SMAppService.mainApp.status == .enabled)
+    }
+  }
+
+  @available(macOS 13.0, *)
+  private func setLaunchAtLogin(_ enabled: Bool) {
+    do {
+      if enabled {
+        try SMAppService.mainApp.register()
+      } else {
+        try SMAppService.mainApp.unregister()
+      }
+    } catch {
+      NSLog("Magic Switch: failed to update Launch at Login: \(error.localizedDescription)")
+      launchAtLogin = (SMAppService.mainApp.status == .enabled)
+    }
+  }
+}
+
+// MARK: - Supporting Views
+
+/// One row of the Keyboard Shortcuts section: the action's name, a recorder
+/// button showing the current chord (or the record/recording prompt), and a
+/// clear button while a chord is set. Recording state lives in
+/// `HotkeyManager` so only one row can record at a time.
+private struct ShortcutRecorderRow: View {
+  let direction: SwitchDirection
+  let title: String
+  let help: String
+
+  @ObservedObject private var hotkey = HotkeyManager.shared
+
+  private var isRecording: Bool { hotkey.recordingDirection == direction }
+  private var shortcut: HotkeyShortcut? { hotkey.shortcuts[direction] }
+
+  /// Compact pill content: the recorded shortcut, an ellipsis while
+  /// recording (the caption below carries the instructions), or a quiet
+  /// "––" placeholder. The tooltip and accessibility label explain the
+  /// affordance, so the pill doesn't need to say "Record Shortcut".
+  private var buttonTitle: String {
+    if isRecording { return "…" }
+    return shortcut?.displayString ?? "––"
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      HStack {
+        Text(title)
+        Spacer()
+        // Clear button sits left of the recorder so the recorder buttons
+        // stay pinned to the trailing edge whether or not it's visible.
+        if shortcut != nil, !isRecording {
+          Button(action: { hotkey.setShortcut(nil, for: direction) }) {
+            Image(systemName: "xmark.circle.fill")
+              .foregroundColor(.secondary)
+          }
+          .buttonStyle(.borderless)
+          .help("Remove this shortcut.")
+          .accessibilityLabel("Remove shortcut: \(title)")
+        }
+        Button(action: toggleRecording) {
+          // The pill hugs its content — a typical chord is a couple of
+          // narrow glyphs ("^2"), so a shared width floor just reads as
+          // dead space. The small floor keeps the empty "––" pill a usable
+          // click target; long chords ("⌃⌥⇧⌘Space") still grow as needed
+          // rather than wrapping, which a hard width did.
+          Text(buttonTitle)
+            .lineLimit(1)
+            .foregroundColor(shortcut == nil && !isRecording ? .secondary : .primary)
+            .frame(minWidth: 36)
+        }
+        .help(help)
+        .accessibilityLabel(
+          isRecording
+            ? String(localized: "Recording shortcut for \(title)")
+            : shortcut.map {
+              String(localized: "Change shortcut for \(title), currently \($0.displayString)")
+            }
+              ?? String(localized: "Record shortcut for \(title)"))
+      }
+      if isRecording {
+        Text("Press a key with ⌘, ⌥, or ⌃. Esc cancels; ⌫ removes the shortcut.")
+          .font(.caption)
+          .foregroundColor(.secondary)
+      }
+    }
+  }
+
+  private func toggleRecording() {
+    if isRecording {
+      hotkey.cancelRecording()
+    } else {
+      hotkey.startRecording(for: direction)
+    }
+  }
+}
+
+/// A reusable row component for settings items
+private struct SettingsRowView: View {
+  // MARK: - Properties
+
+  let title: String
+  let help: String
+  let action: () -> Void
+
+  // MARK: - View Content
+
+  var body: some View {
+    Button(action: action) {
+      HStack {
+        Text(title)
+        Spacer()
+        Image(systemName: "chevron.right")
+          .foregroundColor(.secondary)
+      }
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .help(help)
+  }
+}
+
+// MARK: - Preview
+
+#Preview {
+  OtherSettingsView()
+}

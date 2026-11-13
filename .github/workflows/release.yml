@@ -1,0 +1,410 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    # semantic-release --dry-run still calls `git push --dry-run` to validate
+    # push credentials, which GitHub's git server rejects with 403 unless the
+    # minted token has write scope. No actual push happens (--dry-run is honored).
+    permissions:
+      contents: write
+
+    outputs:
+      new-release-version: ${{ steps.determine_version.outputs.new-release-version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # semantic-release needs full history to determine the next version.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          # The pnpm tooling lives under .github/release/, not the repo root,
+          # so the action must read its pinned `packageManager` version from
+          # there. Without this it scans the (nonexistent) root package.json
+          # and fails with "No pnpm version is specified".
+          package_json_file: .github/release/package.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: .github/release/pnpm-lock.yaml
+
+      - name: Install release tooling
+        # Reproducible, integrity-checked install from the committed lockfile
+        # (pins the full semantic-release dependency tree, not just the majors).
+        working-directory: .github/release
+        run: pnpm install --frozen-lockfile
+
+      - name: Determine version
+        id: determine_version
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MAIN_SHA="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
+          if [ "$MAIN_SHA" != "$GITHUB_SHA" ]; then
+            echo "::notice::main is at $MAIN_SHA, not $GITHUB_SHA; skipping build & release. The run for the newer commit releases it."
+            exit 0
+          fi
+          OUTPUT="$(./.github/release/node_modules/.bin/semantic-release --dry-run --no-ci | tee /dev/stderr)"
+          # Extract just the version triple to avoid picking up trailing
+          # punctuation if the log format ever changes slightly.
+          NEW_RELEASE_VERSION=$(echo "$OUTPUT" \
+            | grep -oE 'next release version is [0-9]+\.[0-9]+\.[0-9]+' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+            || true)
+          if [ -n "$NEW_RELEASE_VERSION" ]; then
+            echo "Will release v$NEW_RELEASE_VERSION"
+            echo "new-release-version=$NEW_RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "No releasable commits since the last tag; skipping build & release."
+          fi
+
+  build:
+    needs: version
+    # Gate build on a real release version. The previous code defaulted an
+    # empty extraction to "0.0.0", which then built and tagged a v0.0.0
+    # release, overwriting tag history.
+    if: needs.version.outputs.new-release-version != ''
+    runs-on: macos-26
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # OIDC token for Sigstore signing
+      attestations: write # publish SLSA build provenance
+    outputs:
+      zip-path: ${{ steps.create_zip.outputs.zip-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Update version
+        env:
+          VERSION: ${{ needs.version.outputs.new-release-version }}
+        run: |
+          IFS=. read -r MAJOR MINOR PATCH <<< "$VERSION"
+          BUILD=$((MAJOR * 1000000 + MINOR * 1000 + PATCH))
+          PROJECT_FILE="Magic Switch.xcodeproj/project.pbxproj"
+          sed -i '' "s/MARKETING_VERSION = .*;/MARKETING_VERSION = $VERSION;/g" "$PROJECT_FILE"
+          sed -i '' "s/CURRENT_PROJECT_VERSION = .*;/CURRENT_PROJECT_VERSION = $BUILD;/g" "$PROJECT_FILE"
+          echo "Version $VERSION, build $BUILD"
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: "26.5"
+
+      - name: Import signing certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          CERT_PATH="$RUNNER_TEMP/signing.p12"
+
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          rm -f "$CERT_PATH"
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Build
+        run: |
+          xcodebuild clean archive \
+            -project "Magic Switch.xcodeproj" \
+            -scheme "Magic Switch" \
+            -configuration Release \
+            -archivePath "Magic Switch.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM=LA3A27SJGR \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            ENABLE_HARDENED_RUNTIME=YES \
+            OTHER_CODE_SIGN_FLAGS="--timestamp"
+
+      - name: Verify signature
+        run: |
+          APP="Magic Switch.xcarchive/Products/Applications/Magic Switch.app"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          DETAILS="$(codesign -dvv "$APP" 2>&1)"
+          echo "$DETAILS"
+          grep -q '^Authority=Developer ID Application: .*(LA3A27SJGR)$' <<< "$DETAILS"
+          grep -q '^TeamIdentifier=LA3A27SJGR$' <<< "$DETAILS"
+          grep -q '^Timestamp=' <<< "$DETAILS"
+
+      - name: Notarize
+        env:
+          NOTARY_API_KEY_P8: ${{ secrets.NOTARY_API_KEY_P8 }}
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_API_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+        run: |
+          APP="Magic Switch.xcarchive/Products/Applications/Magic Switch.app"
+          KEY_PATH="$RUNNER_TEMP/notary.p8"
+          SUBMISSION_ZIP="$RUNNER_TEMP/notarize.zip"
+          AUTH=(--key "$KEY_PATH" --key-id "$NOTARY_API_KEY_ID" --issuer "$NOTARY_API_ISSUER_ID")
+
+          printf '%s\n' "$NOTARY_API_KEY_P8" > "$KEY_PATH"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$SUBMISSION_ZIP"
+
+          RESULT="$(xcrun notarytool submit "$SUBMISSION_ZIP" "${AUTH[@]}" --wait --timeout 2h --output-format json || true)"
+          echo "$RESULT"
+          STATUS="$(plutil -extract status raw -o - - <<< "$RESULT" 2>/dev/null || true)"
+          SUBMISSION_ID="$(plutil -extract id raw -o - - <<< "$RESULT" 2>/dev/null || true)"
+          if [ "$STATUS" != "Accepted" ]; then
+            if [ -n "$SUBMISSION_ID" ]; then
+              xcrun notarytool log "$SUBMISSION_ID" "${AUTH[@]}" || true
+            fi
+            rm -f "$KEY_PATH"
+            exit 1
+          fi
+          rm -f "$KEY_PATH"
+
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          spctl -a -vvv -t exec "$APP"
+
+      - name: Create ZIP
+        id: create_zip
+        run: |
+          cd "Magic Switch.xcarchive/Products/Applications"
+          ditto -c -k --sequesterRsrc --keepParent "Magic Switch.app" "../../../Magic Switch.app.zip"
+          echo "zip-path=$(realpath "../../../Magic Switch.app.zip")" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "Magic Switch.app.zip"
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          cp "Magic Switch.app.zip" artifacts/app.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-artifacts
+          path: artifacts/
+
+      - name: Delete signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+  app-store:
+    needs:
+      - version
+      - release
+    if: needs.version.outputs.new-release-version != ''
+    runs-on: macos-26
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Update version
+        env:
+          VERSION: ${{ needs.version.outputs.new-release-version }}
+        run: |
+          IFS=. read -r MAJOR MINOR PATCH <<< "$VERSION"
+          BUILD=$((MAJOR * 1000000 + MINOR * 1000 + PATCH))
+          PROJECT_FILE="Magic Switch.xcodeproj/project.pbxproj"
+          sed -i '' "s/MARKETING_VERSION = .*;/MARKETING_VERSION = $VERSION;/g" "$PROJECT_FILE"
+          sed -i '' "s/CURRENT_PROJECT_VERSION = .*;/CURRENT_PROJECT_VERSION = $BUILD;/g" "$PROJECT_FILE"
+          echo "Version $VERSION, build $BUILD"
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: "26.5"
+
+      - name: Archive
+        run: |
+          xcodebuild clean archive \
+            -project "Magic Switch.xcodeproj" \
+            -scheme "Magic Switch" \
+            -configuration AppStore \
+            -archivePath "Magic Switch.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY=- \
+            DEVELOPMENT_TEAM=LA3A27SJGR
+
+      - name: Upload to App Store Connect
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: |
+          : "${ASC_API_KEY_P8:?secret not set}" "${ASC_API_KEY_ID:?secret not set}" "${ASC_API_ISSUER_ID:?secret not set}"
+          KEY_PATH="$RUNNER_TEMP/asc.p8"
+          EXPORT_OPTIONS="$RUNNER_TEMP/ExportOptions.plist"
+          trap 'rm -f "$KEY_PATH"' EXIT
+          printf '%s\n' "$ASC_API_KEY_P8" > "$KEY_PATH"
+
+          cat > "$EXPORT_OPTIONS" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>destination</key>
+            <string>upload</string>
+            <key>teamID</key>
+            <string>LA3A27SJGR</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath "Magic Switch.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$EXPORT_OPTIONS" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$ASC_API_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_API_ISSUER_ID"
+
+  release:
+    needs:
+      - version
+      - build
+    if: needs.version.outputs.new-release-version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-artifacts
+          path: artifacts/
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          # The pnpm tooling lives under .github/release/, not the repo root,
+          # so the action must read its pinned `packageManager` version from
+          # there. Without this it scans the (nonexistent) root package.json
+          # and fails with "No pnpm version is specified".
+          package_json_file: .github/release/package.json
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: .github/release/pnpm-lock.yaml
+
+      - name: Install release tooling
+        # Reproducible, integrity-checked install from the committed lockfile
+        # (pins the full semantic-release dependency tree, not just the majors).
+        working-directory: .github/release
+        run: pnpm install --frozen-lockfile
+
+      - name: Release
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./.github/release/node_modules/.bin/semantic-release
+
+      - name: Verify release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.new-release-version }}
+        run: |
+          if ! gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null; then
+            echo "::error::semantic-release did not publish v$VERSION."
+            exit 1
+          fi
+
+  homebrew-tap:
+    needs:
+      - version
+      - release
+    if: needs.version.outputs.new-release-version != ''
+    runs-on: ubuntu-latest
+    environment: homebrew-tap
+    permissions:
+      contents: read
+      attestations: read
+
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: MegaManSec/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+
+      - name: Update cask
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.new-release-version }}
+        run: |
+          CASK=Casks/magic-switch.rb
+          CURRENT="$(sed -nE 's/^  version "(.*)"$/\1/p' "$CASK")"
+          if [ "$(printf '%s\n' "$CURRENT" "$VERSION" | sort -V | tail -n1)" = "$CURRENT" ]; then
+            echo "Cask already at $CURRENT"
+            exit 0
+          fi
+          ZIP="$RUNNER_TEMP/app.zip"
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern app.zip --output "$ZIP"
+          gh attestation verify "$ZIP" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-ref refs/heads/main \
+            --deny-self-hosted-runners
+          SHA256="$(sha256sum "$ZIP" | cut -d' ' -f1)"
+          sed -i -E \
+            -e "s/^  version \".*\"$/  version \"$VERSION\"/" \
+            -e "s/^  sha256 \".*\"$/  sha256 \"$SHA256\"/" \
+            "$CASK"
+          grep -qx "  version \"$VERSION\"" "$CASK"
+          grep -qx "  sha256 \"$SHA256\"" "$CASK"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "magic-switch $VERSION"
+          git push

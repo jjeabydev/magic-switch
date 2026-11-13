@@ -1,0 +1,1830 @@
+import Combine
+import Foundation
+import Network
+import SwiftUI
+
+/// Protocol defining the interface for network device management operations
+protocol NetworkDeviceManageable {
+  /// List of registered network devices
+  var networkDevices: [NetworkDevice] { get }
+  /// List of discovered network devices
+  var discoveredNetworkDevices: [NetworkDevice] { get }
+  /// List of available network devices that can be registered
+  var availableNetworkDevices: [NetworkDevice] { get }
+
+  /// Registers a new network device
+  func registerNetworkDevice(device: NetworkDevice)
+  /// Removes a registered network device
+  func removeNetworkDevice(device: NetworkDevice)
+  /// Updates the information of a network device
+  func updateNetworkDevice(_ device: NetworkDevice)
+}
+
+/// Why no switch can run right now; `userMessage` is the sentence shown for it.
+enum SwitchBlocker {
+  case noOtherMac
+  case notPaired
+  case pendingTrust(NetworkDevice)
+  case unreachable(NetworkDevice)
+
+  var userMessage: String {
+    switch self {
+    case .noOtherMac:
+      return String(localized: "No other Mac is set up — add one in Settings → Macs.")
+    case .notPaired:
+      return OutgoingFailure.notPaired.userMessage
+    case .pendingTrust(let device):
+      return String(
+        localized:
+          "\(device.name) has a new pairing key. Switching is paused until you choose Trust in Settings → Macs."
+      )
+    case .unreachable(let device):
+      return NetworkDeviceStore.shared.unreachableHelp(for: device)
+    }
+  }
+}
+
+/// A user-initiated Macs-tab operation currently in flight to a peer.
+/// Tracked in `NetworkDeviceStore` (not the view) so the row can disable its
+/// buttons and keep rendering progress across Settings tab switches — the
+/// view's local `@State` is reset when the tab is left and re-entered.
+enum DeviceOperation {
+  case ping
+  case sync(count: Int)
+}
+
+/// Manages the state and operations of network devices
+final class NetworkDeviceStore: ObservableObject, NetworkDeviceManageable {
+  // MARK: - Singleton
+
+  static let shared = NetworkDeviceStore()
+
+  // MARK: - Dependencies
+
+  private let servicePublisher = ServicePublisher()
+  private let serviceBrowser = ServiceBrowser()
+
+  // MARK: - Properties
+
+  @Published private(set) var networkDevices: [NetworkDevice] = []
+  @Published private(set) var discoveredNetworkDevices: [NetworkDevice] = []
+  @AppStorage("networkDevices") private var networkDevicesData: Data = Data()
+
+  /// Last active-probe result per device id (runtime only, never persisted).
+  /// Combined signal: Bonjour resolve/withdraw write it on each transition,
+  /// and a repeating secure-channel probe (plus one on menu open) keeps it
+  /// honest between Bonjour events — so a peer that vanished without a
+  /// Bonjour goodbye flips to false within one poll interval instead of
+  /// waiting out the mDNS TTL.
+  @Published private(set) var deviceReachability: [String: Bool] = [:]
+  private var reachabilityTimer: DispatchSourceTimer?
+  private static let reachabilityInterval: TimeInterval = 30
+  /// Delay before the fast off-cycle recheck that confirms a *first* missed
+  /// poll (see `scheduleFastReachabilityRecheck`). Short enough to collapse the
+  /// ~30s worst-case detection latency that otherwise leaves a vanished peer's
+  /// peripherals unclaimed while this Mac is awake; long enough that a single
+  /// dropped packet clears on the retry rather than arming adoption.
+  private static let fastRecheckDelay: TimeInterval = 3
+
+  /// Body-read timeout for the two commands whose receiver only acks after it
+  /// has actually finished (re-)pairing — `CONNECT_ALL` and `CONNECT_ONE` —
+  /// rather than acking on receipt. It must exceed the receiver's worst-case
+  /// connect time (its pair watchdog, `pairTimeout`, is 60s) so the sender
+  /// waits for the real result instead of giving up early; and the receiver's
+  /// `IncomingConnection.idleTimeout` must stay >= this so it doesn't idle-kill
+  /// the connection before sending that ack. Apart from the releases below,
+  /// every other command acks immediately and uses `OutgoingConnection`'s 5s
+  /// default.
+  private static let handoffBodyTimeout: TimeInterval = 75
+  /// Body-read timeout for `UNREGISTER_ALL` and `UNREGISTER_ONE`, whose
+  /// receiver acks only once its peripherals have actually disconnected, or
+  /// after its `releaseDisconnectTimeout` (15s) gives up.
+  /// `IncomingConnection.idleTimeout` must stay >= this too.
+  private static let releaseBodyTimeout: TimeInterval = 30
+
+  /// Consecutive failed `.ping` polls per device id (runtime only). Drives
+  /// the peer-vanished adoption trigger: one missed poll is routine (Wi-Fi
+  /// blip, mid-transition), two in a row is a peer that's genuinely gone —
+  /// asleep, shut down, off the network. The second miss is now reached in a
+  /// few seconds (see `scheduleFastReachabilityRecheck`) rather than across two
+  /// 30s polls. Main-only.
+  private var consecutivePollFailures: [String: Int] = [:]
+
+  /// Devices with a fast off-cycle reachability recheck already scheduled, so
+  /// overlapping triggers (a missed poll and a Bonjour withdraw landing
+  /// together) don't stack up multiple rechecks. Main-only.
+  private var pendingFastRecheck: Set<String> = []
+
+  /// Advertised names with a rename-migration or endpoint-move proof ping
+  /// already in flight, so a burst of resolves for the same service doesn't fan
+  /// out into a burst of pings. Main-only. See `migrateRenamedPeerIfNeeded` and
+  /// `verifyMovedEndpointIfNeeded`.
+  private var pendingMigrationProofs: Set<String> = []
+
+  /// TTL for discovered entries with no live Bonjour presence (INTRODUCE-
+  /// sourced ones): they never get a Bonjour goodbye, so unrefreshed ones
+  /// must expire — else a stale entry blocks `renameCandidateID` forever.
+  /// Entries the browser still sees on the air are exempt; a Bonjour
+  /// resolve fires once per `didFind`, so a quiet-but-advertising peer
+  /// would otherwise decay.
+  private static let introducedDeviceTTL: TimeInterval = 2.5 * reachabilityInterval
+
+  /// The `BLETransport` peripheral each peer Mac proved itself on, by device
+  /// id. Runtime only, relearned from each rescan. Main-only.
+  private var bluetoothPeers: [String: UUID] = [:]
+  /// Peripherals with an identifying INTRODUCE in flight, and when each one
+  /// that failed last did. Main-only.
+  private var pendingBluetoothProbes: Set<UUID> = []
+  private var bluetoothProbeFailures: [UUID: Date] = [:]
+  private static let maxBluetoothProbes = 2
+  private static let bluetoothProbeBackoff: TimeInterval = 2 * 60
+  /// How long a reachability probe waits on the network before also trying
+  /// Bluetooth, unless the network answered the last probe.
+  private static let bluetoothProbeHeadStart: TimeInterval = 1
+  /// Registered devices whose latest reachability probe only got through over
+  /// Bluetooth, or whose latest command did. Orders their routes (see
+  /// `routes(for:)`) and badges their rows.
+  @Published private(set) var reachedOverBluetooth: Set<String> = []
+  private var bluetoothSettingObserver: AnyCancellable?
+  private var bluetoothSettingForwarder: AnyCancellable?
+
+  /// In-flight Ping/Sync per device id. Set when the user taps Ping/Sync on the
+  /// Macs tab and cleared when the op finishes; the view both disables the
+  /// buttons and renders the "Pinging…/Syncing…" line off this, so they survive
+  /// leaving and re-entering the tab (the view's own `@State` wouldn't).
+  @Published private(set) var inFlightOperations: [String: DeviceOperation] = [:]
+
+  // MARK: - Computed Properties
+
+  var availableNetworkDevices: [NetworkDevice] {
+    // "Self" is recognised by address, not by name. When two Macs share a
+    // device name, mDNS renames one of the advertised services, so the old
+    // name-based check (`discovered.name != Host.current().localizedName`)
+    // made a Mac hide its real peer (same name) while listing itself
+    // (renamed). The address we resolve for our own advertised service is
+    // always one of this machine's interface addresses; a peer's never is.
+    let localHosts = Self.localAddresses()
+    return discoveredNetworkDevices.filter { discovered in
+      let isNotSelf = !localHosts.contains(Self.normalizeHost(discovered.host))
+      let isNotRegistered = !networkDevices.contains(where: { $0.id == discovered.id })
+      return isNotSelf && isNotRegistered
+    }
+  }
+
+  // MARK: - Initialization
+
+  private init() {
+    loadNetworkDevices()
+    startServices()
+    startReachabilityPolling()
+  }
+
+  deinit {
+    stopServices()
+    reachabilityTimer?.cancel()
+  }
+
+  // MARK: - Service Management
+
+  private func startServices() {
+    servicePublisher.startPublishing()
+    serviceBrowser.startBrowsing()
+    BLETransport.shared.start(
+      localIdentity: { [weak self] in self?.servicePublisher.currentIdentity() },
+      onPeerDiscovered: { [weak self] in self?.identifyBluetoothPeer($0) })
+    bluetoothSettingForwarder = BLETransport.shared.$isEnabled
+      .removeDuplicates()
+      .dropFirst()
+      .sink { [weak self] _ in self?.objectWillChange.send() }
+    bluetoothSettingObserver = BLETransport.shared.$isEnabled
+      .removeDuplicates()
+      .dropFirst()
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] enabled in
+        guard let self = self, !enabled else { return }
+        self.bluetoothPeers.removeAll()
+        self.reachedOverBluetooth.removeAll()
+        self.bluetoothProbeFailures.removeAll()
+        self.discoveredNetworkDevices.removeAll { $0.networkRoute == nil }
+        self.pollReachability()
+      }
+  }
+
+  private func stopServices() {
+    servicePublisher.stopPublishing()
+    serviceBrowser.stopBrowsing()
+  }
+
+  // MARK: - Public Methods
+
+  func registerNetworkDevice(device: NetworkDevice) {
+    // Don't drop from `discoveredNetworkDevices`; `availableNetworkDevices`
+    // filters by `!networkDevices.contains` at read time. Dropping here
+    // would mean `removeNetworkDevice` can't re-surface the Mac under
+    // "Macs Found on the Network" until the next Bonjour resolution.
+    networkDevices.append(device)
+    saveNetworkDevices()
+    if PairingStore.shared.isPaired, !isReachable(device.id) {
+      probeReachability(of: device)
+    }
+  }
+
+  func removeNetworkDevice(device: NetworkDevice) {
+    networkDevices.removeAll { $0.id == device.id }
+    reachedOverBluetooth.remove(device.id)
+    saveNetworkDevices()
+  }
+
+  func updateNetworkDevice(_ device: NetworkDevice) {
+    updateNetworkDevice(device, proven: false)
+  }
+
+  /// `proven` means the peer just demonstrated this endpoint over the secure
+  /// channel (an INTRODUCE handshake), so it may relocate a pinned record's
+  /// routing at once. An unproven Bonjour resolve may not: its `fp` is
+  /// cleartext multicast any LAN listener can echo, so a matching fingerprint
+  /// alone can't authorise pointing `host`/`port` at an attacker-chosen host.
+  private func updateNetworkDevice(_ device: NetworkDevice, proven: Bool) {
+    // Never let an advertisement re-point a registered record at this Mac.
+    // Our own service carries the *same* `fp` as the peer — it's a hash of the
+    // shared PSK — so `update(with:)` would take it as a trusted routing
+    // update. That is reachable without an attacker: when both Macs share a
+    // computer name, mDNS gives one of them a "Name (2)" suffix, and if that
+    // suffix is the name registered for the peer, this Mac starts sending its
+    // own switch commands to itself — releasing every peripheral and
+    // re-pairing it locally (a multi-second loss of keyboard and trackpad)
+    // while the real peer gets nothing. Self is recognised by address, the
+    // same way `availableNetworkDevices` does it.
+    guard !Self.localAddresses().contains(Self.normalizeHost(device.host)) else { return }
+    migrateRenamedPeerIfNeeded(for: device)
+    if let index = networkDevices.firstIndex(where: { $0.id == device.id }) {
+      // The poll's INTRODUCE lands here every 30s; don't rewrite AppStorage
+      // and re-render observers when nothing changed.
+      let prior = networkDevices[index]
+      if prior.host == device.host, prior.port == device.port,
+        prior.fingerprint == device.fingerprint, prior.isActive == device.isActive,
+        prior.pendingFingerprint == nil
+      {
+        if deviceReachability[device.id] != device.isActive {
+          deviceReachability[device.id] = device.isActive
+        }
+        return
+      }
+      // An unproven resolve carrying the pinned fingerprint but a *new*
+      // endpoint isn't trusted to relocate routing — the fp is cleartext and
+      // any LAN listener can echo it. Prove the endpoint over the secure
+      // channel first (as `migrateRenamedPeerIfNeeded` does for a rename),
+      // leaving the verified routing untouched until it does.
+      if !proven, let stored = prior.fingerprint, stored == device.fingerprint,
+        prior.host != device.host || prior.port != device.port
+      {
+        verifyMovedEndpointIfNeeded(for: device)
+        return
+      }
+      let priorFingerprint = prior.fingerprint
+      networkDevices[index].update(with: device)
+      saveNetworkDevices()
+      // Fold the Bonjour signal into reachability: a fresh resolve is a good
+      // indication the peer is up; a mismatch (isActive == false) keeps it
+      // greyed. The `.ping` poll refines this between Bonjour events.
+      deviceReachability[device.id] = networkDevices[index].isActive
+      // A proven update carrying this Mac's own current key is the far side
+      // of a mutual re-pair: the resolve that follows clears the park in the
+      // same tick, so there is no warning for the user to see.
+      if let prior = priorFingerprint,
+        let incoming = device.fingerprint,
+        prior != incoming,
+        !(proven && incoming == PairingStore.shared.fingerprint)
+      {
+        NotificationManager.showNotification(
+          title: String(localized: "Identity Mismatch"),
+          body:
+            String(
+              localized:
+                "\(device.name) has a new pairing key. If you re-paired the other Mac yourself, open Settings → Macs and choose Trust."
+            ),
+          identifier: "identity-mismatch-\(device.id)"
+        )
+      }
+    }
+  }
+
+  /// A peer proved the pairing key and stated its listen endpoint
+  /// (`INTRODUCE`). Runs through the same pipeline as a Bonjour resolve, so
+  /// TOFU pinning, the self-address guard, and rename migration all apply —
+  /// with a stronger source: the fingerprint was proved by the handshake,
+  /// not read from a cleartext TXT record.
+  func ingestIntroducedPeer(name: String, host: String, port: Int, provedFingerprint: String) {
+    // Without Bonjour's collision rename, a same-named peer would fight this
+    // Mac over one name-keyed entry. Refuse; renaming a Mac is the fix.
+    guard !isLocalName(name) else {
+      Log.network.error("Refusing INTRODUCE from a peer using this Mac's own name: \(name)")
+      return
+    }
+    let device = NetworkDevice(
+      id: name,
+      name: name,
+      host: host,
+      port: port,
+      isActive: true,
+      fingerprint: provedFingerprint
+    )
+    let wasPending = networkDevices.first { $0.id == name }?.pendingFingerprint != nil
+    addDiscoveredNetworkDevice(device)
+    updateNetworkDevice(device, proven: true)
+    // After the update: if it just parked this record pending exactly the
+    // proved key, the proof supersedes the warning in the same tick (the
+    // handshake-time resolve hooks fired before these frames existed). Only
+    // a park the user could already have seen is worth announcing.
+    resolvePendingFingerprint(provedByHandshake: provedFingerprint, announce: wasPending)
+  }
+
+  /// Files an INTRODUCE reply by the route that carried it. A network reply
+  /// may relocate the peer's endpoint (`ingestIntroducedPeer`); a Bluetooth one
+  /// only records which peripheral it answered on.
+  private func ingestIntroduction(
+    _ identity: IntroducedIdentity, provedFingerprint: String, over route: PeerRoute
+  ) {
+    switch route {
+    case .network(let host, _):
+      ingestIntroducedPeer(
+        name: identity.name, host: host, port: Int(identity.port),
+        provedFingerprint: provedFingerprint)
+    case .bluetooth(let peripheral):
+      ingestBluetoothPeer(
+        name: identity.name, peripheral: peripheral, provedFingerprint: provedFingerprint)
+    }
+  }
+
+  /// A peer proved the pairing key over `peripheral`. Route future commands to
+  /// that Mac through it, follow a rename of the registered Mac, and list it —
+  /// with no endpoint when it hasn't otherwise been found.
+  private func ingestBluetoothPeer(name: String, peripheral: UUID, provedFingerprint: String) {
+    guard BLETransport.shared.isEnabled, !isLocalName(name) else { return }
+    bluetoothPeers[name] = peripheral
+    if !networkDevices.contains(where: { $0.id == name }),
+      let candidateID = renameCandidateID(forFingerprint: provedFingerprint),
+      let index = networkDevices.firstIndex(where: { $0.id == candidateID })
+    {
+      let old = networkDevices[index]
+      commitRenameMigration(
+        at: index, to: NetworkDevice(id: name, name: name, host: old.host, port: old.port),
+        fingerprint: provedFingerprint)
+    }
+    if let index = discoveredNetworkDevices.firstIndex(where: { $0.id == name }) {
+      let known = discoveredNetworkDevices[index]
+      discoveredNetworkDevices[index].update(
+        with: NetworkDevice(
+          id: name, name: name, host: known.host, port: known.port,
+          fingerprint: provedFingerprint))
+    } else {
+      discoveredNetworkDevices.append(
+        NetworkDevice(id: name, name: name, host: "", port: 0, fingerprint: provedFingerprint))
+    }
+    resolvePendingFingerprint(provedByHandshake: provedFingerprint)
+  }
+
+  /// `BLETransport` found a peripheral advertising this pairing's service.
+  /// Only a handshake can say which Mac it is, so INTRODUCE over it — unless
+  /// it's already identified as a Mac still listed here. Identifications are
+  /// capped, and a peripheral that failed one waits out
+  /// `bluetoothProbeBackoff`.
+  private func identifyBluetoothPeer(_ peripheral: UUID) {
+    let listed = bluetoothPeers.contains { name, mapped in
+      mapped == peripheral
+        && (networkDevices.contains { $0.id == name }
+          || discoveredNetworkDevices.contains { $0.id == name && $0.isActive })
+    }
+    let backedOff = bluetoothProbeFailures[peripheral].map {
+      Date().timeIntervalSince($0) < Self.bluetoothProbeBackoff
+    }
+    guard PairingStore.shared.isPaired, !listed, backedOff != true,
+      servicePublisher.currentIdentity() != nil,
+      pendingBluetoothProbes.count < Self.maxBluetoothProbes,
+      pendingBluetoothProbes.insert(peripheral).inserted
+    else { return }
+    executeIntroduce(over: [.bluetooth(peripheral)], countsTowardRateLimit: false) {
+      [weak self] result in
+      DispatchQueue.main.async {
+        guard let self = self else { return }
+        self.pendingBluetoothProbes.remove(peripheral)
+        guard BLETransport.shared.isEnabled else { return }
+        switch result {
+        case .success(.peer(let identity, let proved, let route)):
+          self.bluetoothProbeFailures.removeValue(forKey: peripheral)
+          self.ingestIntroduction(identity, provedFingerprint: proved, over: route)
+          if let device = self.networkDevices.first(where: { $0.id == identity.name }),
+            self.isProbeEligible(device), !self.isReachable(device.id)
+          {
+            self.probeReachability(of: device)
+          }
+        case .success(.legacy), .success(.unavailable):
+          // Nothing to ingest, but the handshake completed.
+          break
+        case .failure:
+          self.bluetoothProbeFailures[peripheral] = Date()
+        }
+      }
+    }
+  }
+
+  /// The routes to `device`, in dialing order: the network, then Bluetooth when
+  /// it's enabled and the peer has proved itself there. A device whose latest
+  /// probe only got through over Bluetooth is dialed that way first.
+  private func routes(for device: NetworkDevice) -> [PeerRoute] {
+    let network = Self.networkRoutes(to: device)
+    let bluetooth = bluetoothRoutes(to: device)
+    return reachedOverBluetooth.contains(device.id) ? bluetooth + network : network + bluetooth
+  }
+
+  /// `completion`, after ordering the next dial to `device` by the route
+  /// `outgoing` got through on. Passes `completion` through when `device` is nil.
+  private func orderingRoutes(
+    of device: NetworkDevice?, by outgoing: OutgoingConnection,
+    then completion: @escaping (Result<Void, OutgoingFailure>) -> Void
+  ) -> (Result<Void, OutgoingFailure>) -> Void {
+    guard let device = device else { return completion }
+    return { [weak self, weak outgoing] result in
+      if let route = outgoing?.route {
+        DispatchQueue.main.async {
+          guard let self = self, self.networkDevices.contains(where: { $0.id == device.id })
+          else { return }
+          self.setReachedOverBluetooth(route.isBluetooth, for: device.id)
+        }
+      }
+      completion(result)
+    }
+  }
+
+  private func setReachedOverBluetooth(_ overBluetooth: Bool, for id: String) {
+    guard reachedOverBluetooth.contains(id) != overBluetooth else { return }
+    if overBluetooth {
+      reachedOverBluetooth.insert(id)
+    } else {
+      reachedOverBluetooth.remove(id)
+    }
+  }
+
+  /// Just `device`'s TCP endpoint. For probes that must prove that endpoint
+  /// specifically.
+  private static func networkRoutes(to device: NetworkDevice) -> [PeerRoute] {
+    device.networkRoute.map { [$0] } ?? []
+  }
+
+  /// The peripheral `device` proved itself on, while the transport is on.
+  private func bluetoothRoutes(to device: NetworkDevice) -> [PeerRoute] {
+    guard BLETransport.shared.isEnabled, let peripheral = bluetoothPeers[device.id] else {
+      return []
+    }
+    return [.bluetooth(peripheral)]
+  }
+
+  /// Whether `device` is reached over Bluetooth: a reachable registered Mac
+  /// whose latest probe only got through that way or that has no network
+  /// endpoint, or a found Mac with no network endpoint.
+  func isReachedOverBluetooth(_ device: NetworkDevice) -> Bool {
+    guard BLETransport.shared.isEnabled else { return false }
+    if networkDevices.contains(where: { $0.id == device.id }) {
+      return isReachable(device.id)
+        && (reachedOverBluetooth.contains(device.id) || device.networkRoute == nil)
+    }
+    return device.networkRoute == nil
+  }
+
+  /// Hover text for a registered Mac that isn't reachable.
+  func unreachableHelp(for device: NetworkDevice) -> String {
+    BLETransport.shared.isEnabled
+      ? String(
+        localized: "\(device.name) isn't reachable on the network or over Bluetooth right now.")
+      : String(localized: "\(device.name) isn't reachable on the network right now.")
+  }
+
+  /// A Mac's Bonjour service name follows its computer name, and `id` *is*
+  /// that name — so a renamed peer advertises as a brand-new identity while
+  /// its registered record (under the old name) never hears another update and
+  /// sits unreachable forever. When an advertisement *proves* it holds the
+  /// pairing key, and the registered record's own name has gone off the air,
+  /// move that record to the new name in place.
+  ///
+  /// The proof is a `.ping` completed over the secure channel — deliberately
+  /// not the `fp` in the TXT record. That fingerprint is the first four bytes
+  /// of SHA256(PSK) published in cleartext multicast, and *both* Macs
+  /// advertise the identical value, so anyone who can listen on the LAN can
+  /// echo it. Gating on fp alone would let a bystander advertise under any
+  /// unused name while the real peer sleeps and capture its record — and
+  /// stickily, because the record would then be keyed to the impostor's name,
+  /// leaving the real peer unable to win it back (its own name is no longer
+  /// registered) short of a manual Remove and Add. Completing a ping requires
+  /// the PSK itself, which the fingerprint does not reveal.
+  ///
+  /// Remaining guards: the advertised name must not already be registered; the
+  /// record must not be parked behind an unresolved identity mismatch (else a
+  /// migration would silently cancel a Trust the user never gave); exactly one
+  /// record may match, so ambiguity never picks a victim; and never migrate
+  /// toward this Mac's own advertisement.
+  ///
+  /// Note this can't follow a rename that also re-paired: a new pairing key
+  /// matches no pin, which is the Identity Mismatch path and the user's
+  /// explicit Trust. A ping also can't distinguish the same Mac renamed from a
+  /// *different* Mac paired with the same code — both hold the key — which is
+  /// why the notification asks the user to confirm which Mac is listed.
+  private func migrateRenamedPeerIfNeeded(for discovered: NetworkDevice) {
+    guard let incoming = discovered.fingerprint,
+      !networkDevices.contains(where: { $0.id == discovered.id }),
+      !Self.localAddresses().contains(Self.normalizeHost(discovered.host)),
+      !pendingMigrationProofs.contains(discovered.id),
+      let candidateID = renameCandidateID(forFingerprint: incoming)
+    else { return }
+
+    pendingMigrationProofs.insert(discovered.id)
+    // Aimed at the newly *advertised* host/port alone — never a Bluetooth
+    // fallback — so a success proves whoever answers there holds the pairing
+    // key. Off the rate limiter for the same reason the reachability poll is:
+    // this is our own probe, not a user action. It only ever fires at an
+    // advertiser already echoing our exact fingerprint, so it can't spray pings
+    // at unrelated Macs.
+    executeCommand(.ping, over: Self.networkRoutes(to: discovered), countsTowardRateLimit: false) {
+      [weak self] result in
+      DispatchQueue.main.async {
+        guard let self = self else { return }
+        self.pendingMigrationProofs.remove(discovered.id)
+        guard case .success = result else {
+          Log.network.error(
+            "Rename migration refused: \"\(discovered.id)\" advertised a matching fingerprint but couldn't prove the pairing key"
+          )
+          return
+        }
+        // Re-check every guard: the ping was async, so the record may since
+        // have been removed, registered under the new name, parked by a
+        // mismatch, or joined by a second candidate.
+        guard !self.networkDevices.contains(where: { $0.id == discovered.id }),
+          self.renameCandidateID(forFingerprint: incoming) == candidateID,
+          let index = self.networkDevices.firstIndex(where: { $0.id == candidateID })
+        else { return }
+        self.commitRenameMigration(at: index, to: discovered, fingerprint: incoming)
+      }
+    }
+  }
+
+  /// The one registered record a rename could plausibly refer to: pinned to
+  /// `fingerprint`, not parked behind an identity mismatch, and no longer
+  /// advertising under its own name (a record whose name is still on the air
+  /// isn't a rename — that Mac is alive under its original identity). Returns
+  /// nil unless exactly one matches.
+  private func renameCandidateID(forFingerprint fingerprint: String) -> String? {
+    let advertisedNames = Set(discoveredNetworkDevices.filter { $0.isActive }.map { $0.id })
+    let candidates = networkDevices.filter {
+      $0.fingerprint == fingerprint
+        && $0.pendingFingerprint == nil
+        && !advertisedNames.contains($0.id)
+    }
+    guard candidates.count == 1 else { return nil }
+    return candidates.first?.id
+  }
+
+  private func commitRenameMigration(
+    at index: Int, to discovered: NetworkDevice, fingerprint: String
+  ) {
+    let old = networkDevices[index]
+    networkDevices[index] = NetworkDevice(
+      id: discovered.id,
+      name: discovered.name,
+      host: discovered.host,
+      port: discovered.port,
+      isActive: true,
+      fingerprint: fingerprint
+    )
+    // Drop the runtime state keyed to the retired name so a late Bonjour
+    // withdraw for it can't resurrect a stale entry, and so its failure streak
+    // doesn't arm peripheral adoption against a peer that's alive under the
+    // new name. `inFlightOperations` is deliberately left alone: its
+    // completion clears itself by the id it captured, and re-keying it here
+    // would leave the new row's buttons disabled for good.
+    deviceReachability.removeValue(forKey: old.id)
+    consecutivePollFailures.removeValue(forKey: old.id)
+    reachedOverBluetooth.remove(old.id)
+    if let peripheral = bluetoothPeers.removeValue(forKey: old.id),
+      bluetoothPeers[discovered.id] == nil
+    {
+      bluetoothPeers[discovered.id] = peripheral
+    }
+    // Seeding reachable isn't the optimism the pessimistic default guards
+    // against — the ping that authorised this migration *is* a live probe.
+    deviceReachability[discovered.id] = true
+    consecutivePollFailures[discovered.id] = 0
+    saveNetworkDevices()
+    Log.network.notice(
+      "Migrated registered Mac \"\(old.name)\" -> \"\(discovered.name)\" (proved the pairing key)")
+    NotificationManager.showNotification(
+      title: String(localized: "Other Mac Renamed"),
+      body:
+        String(
+          localized:
+            "\(old.name) is now called \(discovered.name), so its entry in Settings → Macs was updated. If you didn't rename that Mac, check which Mac is listed there."
+        ),
+      identifier: "peer-renamed-\(discovered.id)"
+    )
+  }
+
+  /// A pinned registered peer advertising a *new* endpoint under its own name
+  /// may be a real IP/port change — or a LAN bystander echoing the cleartext
+  /// `fp` to redirect us at a host it controls. Probe the advertised endpoint
+  /// and relocate the record only if whoever answers there proves the pairing
+  /// key. Same proof and in-flight de-dup as `migrateRenamedPeerIfNeeded`.
+  private func verifyMovedEndpointIfNeeded(for discovered: NetworkDevice) {
+    guard !pendingMigrationProofs.contains(discovered.id) else { return }
+    pendingMigrationProofs.insert(discovered.id)
+    executeCommand(.ping, over: Self.networkRoutes(to: discovered), countsTowardRateLimit: false) {
+      [weak self] result in
+      DispatchQueue.main.async {
+        guard let self = self else { return }
+        self.pendingMigrationProofs.remove(discovered.id)
+        guard case .success = result,
+          let index = self.networkDevices.firstIndex(where: { $0.id == discovered.id }),
+          self.networkDevices[index].fingerprint == discovered.fingerprint,
+          self.networkDevices[index].pendingFingerprint == nil
+        else { return }
+        self.networkDevices[index].update(with: discovered)
+        self.saveNetworkDevices()
+        self.deviceReachability[discovered.id] = self.networkDevices[index].isActive
+      }
+    }
+  }
+
+  /// Re-attempt migration against services already resolved. A resolve happens
+  /// once per Bonjour `didFind` and nothing re-runs it, so when the renamed
+  /// service resolves *before* the old name's goodbye arrives — a coin flip,
+  /// and the likely order when a Mac reboots under a new name — the candidate
+  /// check sees the old name still on the air and declines. Without this the
+  /// migration would then wait for the peer's service to cycle again, or for
+  /// the user to hit Refresh.
+  private func retryRenameMigrationFromDiscovered() {
+    for discovered in discoveredNetworkDevices where discovered.isActive {
+      migrateRenamedPeerIfNeeded(for: discovered)
+    }
+  }
+
+  /// Promote `pendingFingerprint` to the stored pin and re-mark the device
+  /// active. Invoked from the UI when the user explicitly trusts a new key
+  /// after an Identity Mismatch (e.g., they re-paired the other Mac).
+  func trustPendingFingerprint(for deviceID: String) {
+    guard let index = networkDevices.firstIndex(where: { $0.id == deviceID }),
+      let pending = networkDevices[index].pendingFingerprint
+    else { return }
+    networkDevices[index].fingerprint = pending
+    networkDevices[index].pendingFingerprint = nil
+    networkDevices[index].isActive = true
+    networkDevices[index].lastUpdated = Date()
+    // Trust is a positive presence signal — the peer is on the network, which
+    // is how we saw the new key — so clear the stale `false` reachability the
+    // mismatch left behind rather than make the user wait for the next poll to
+    // un-grey the menu row.
+    deviceReachability[deviceID] = true
+    saveNetworkDevices()
+    NotificationManager.removeNotification(identifier: "identity-mismatch-\(deviceID)")
+  }
+
+  /// A peer just completed a secure-channel handshake, proving it holds the
+  /// key whose fingerprint is `provedFingerprint` — the exact PSK snapshot
+  /// that channel ran with, not whatever is current by the time this hop
+  /// lands, so a handshake that raced a re-pair can't clear a warning about
+  /// a key the peer never proved. If a registered device is parked behind
+  /// an Identity Mismatch whose pending fingerprint is exactly the current
+  /// key's fingerprint (and the proof is for that same key), the proof
+  /// supersedes the warning: the handshake demonstrates the very thing
+  /// Trust would have taken on faith from a cleartext TXT record. That is
+  /// the "both Macs were re-paired" state — the pin predates the re-pair
+  /// while both sides already share the new key — and without this the
+  /// warning sticks (and outgoing switching stays paused) until the user
+  /// manually Trusts on each Mac, even though incoming commands from the
+  /// peer were honored the whole time, making the warning read like an
+  /// enforcement it never was.
+  ///
+  /// Deliberately narrow: a pending fingerprint that matches anything
+  /// *other* than the current key stays parked for the user to judge — the
+  /// handshake says nothing about a key this Mac doesn't hold.
+  ///
+  /// Called from both connection directions — the responder side on an
+  /// incoming handshake, the initiator side on an outgoing one (the
+  /// handshake is mutual, each side verifies the other's transcript MAC
+  /// before reporting success) — so whichever Mac's reachability poll fires
+  /// first heals both ends of a symmetric mutual-re-pair park.
+  func resolvePendingFingerprint(provedByHandshake provedFingerprint: String, announce: Bool = true)
+  {
+    guard let currentFingerprint = PairingStore.shared.fingerprint,
+      provedFingerprint == currentFingerprint
+    else { return }
+    var changed = false
+    for index in networkDevices.indices
+    where networkDevices[index].pendingFingerprint == currentFingerprint {
+      networkDevices[index].fingerprint = currentFingerprint
+      networkDevices[index].pendingFingerprint = nil
+      networkDevices[index].isActive = true
+      networkDevices[index].lastUpdated = Date()
+      // Same positive presence signal as a manual Trust: the proof arrived
+      // over a live connection from the peer.
+      deviceReachability[networkDevices[index].id] = true
+      changed = true
+      // Mirror the rename self-heal's announcement so the warning doesn't
+      // just silently vanish on a user who saw it appear. Reusing the
+      // mismatch identifier replaces the stale "choose Trust" alert in
+      // Notification Center instead of stacking next to it.
+      Log.network.notice(
+        "Resolved identity mismatch for \"\(networkDevices[index].name)\" (peer proved the current pairing key)"
+      )
+      guard announce else { continue }
+      NotificationManager.showNotification(
+        title: String(localized: "Identity Mismatch Resolved"),
+        body:
+          String(
+            localized:
+              "\(networkDevices[index].name) proved it has this Mac's current pairing key, so switching resumed. If you didn't re-pair both Macs yourself, pair them again with a fresh code."
+          ),
+        identifier: "identity-mismatch-\(networkDevices[index].id)"
+      )
+    }
+    if changed {
+      saveNetworkDevices()
+    }
+  }
+
+  /// Tear down and re-start Bonjour browsing. Used by the "Refresh" button
+  /// when the discovered list goes stale (network change, sleep/wake).
+  func refreshDiscovery() {
+    discoveredNetworkDevices = []
+    bluetoothProbeFailures.removeAll()
+    serviceBrowser.refresh()
+    BLETransport.shared.rescan()
+    // Introduced entries only repopulate via an exchange; kick one now.
+    pollReachability()
+  }
+
+  /// The port this Mac accepts peer connections on. Shown in the Add a Mac by
+  /// Address sheet so the value can be read off this screen when setting up the other Mac.
+  var localListeningPort: UInt16? { servicePublisher.currentIdentity()?.port }
+
+  /// Both names this Mac answers to: its device name and (when mDNS renamed
+  /// a collision) the name actually advertised.
+  private func isLocalName(_ name: String) -> Bool {
+    name == Host.current().localizedName || name == servicePublisher.currentIdentity()?.name
+  }
+
+  /// Adds a newly discovered network device
+  func addDiscoveredNetworkDevice(_ device: NetworkDevice) {
+    if let index = discoveredNetworkDevices.firstIndex(where: { $0.id == device.id }) {
+      discoveredNetworkDevices[index].update(with: device)
+    } else {
+      discoveredNetworkDevices.append(device)
+    }
+  }
+
+  /// Removes a discovered network device by name
+  func removeDiscoveredNetworkDevice(named name: String) {
+    discoveredNetworkDevices.removeAll { $0.name == name }
+  }
+
+  /// Updates the active state of a device
+  func updateDeviceIsActive(id: String, isActive: Bool) {
+    if let index = networkDevices.firstIndex(where: { $0.id == id }) {
+      networkDevices[index].isActive = isActive
+      saveNetworkDevices()
+    }
+    if let index = discoveredNetworkDevices.firstIndex(where: { $0.id == id }) {
+      discoveredNetworkDevices[index].isActive = isActive
+    }
+    // Mirror Bonjour's verdict into reachability (a withdraw is a valid, if
+    // slow, offline signal); the `.ping` poll provides the fast path.
+    deviceReachability[id] = isActive
+
+    // A Bonjour withdraw is a *hint* the peer left, not proof — it can be an
+    // mDNS flap while the peer is still reachable, and (behind a Bonjour sleep
+    // proxy) a genuinely sleeping peer may not withdraw at all. So don't wait
+    // out a full poll interval: confirm now. If the peer answers, the probe
+    // re-marks it reachable; if it doesn't, this lands as the first miss and
+    // the fast-recheck path arms adoption within seconds — closing the gap
+    // where a peer that vanished while this Mac was awake left its peripherals
+    // unclaimed for ~a minute. Guard `isPaired` so the probe can't book a
+    // spurious `.notPaired` failure into the streak.
+    if !isActive, PairingStore.shared.isPaired,
+      let device = networkDevices.first(where: { $0.id == id && isProbeEligible($0) })
+    {
+      probeReachability(of: device)
+    }
+
+    // This withdraw may be the missing half of a rename: the new name often
+    // resolves before the old one says goodbye, and that earlier resolve is
+    // never repeated. Now that the old name is off the air, re-test the
+    // services already in hand.
+    if !isActive {
+      retryRenameMigrationFromDiscovered()
+    }
+  }
+
+  // MARK: - Reachability
+
+  /// Pessimistic default: until a Bonjour resolve or a `.ping` has actually
+  /// confirmed the peer, treat it as unreachable. The probe is async, so it
+  /// can't gate the first (synchronous) menu build — an optimistic default
+  /// would show an offline peer's row enabled on a cold start until the first
+  /// probe lands. An online peer un-greys within ~1s: a Bonjour resolve writes
+  /// `true`, and the first poll confirms it.
+  func isReachable(_ id: String) -> Bool { deviceReachability[id] ?? false }
+
+  /// Why no switch can run right now, or nil when one can. The menu, the
+  /// Peripherals tab and the switch guards all explain a refusal from this,
+  /// so one state is never described two ways. Main-only.
+  func switchBlocker() -> SwitchBlocker? {
+    guard let device = networkDevices.first else { return .noOtherMac }
+    guard PairingStore.shared.isPaired else { return .notPaired }
+    if device.pendingFingerprint != nil { return .pendingTrust(device) }
+    return isReachable(device.id) ? nil : .unreachable(device)
+  }
+
+  /// A device is switchable when both Macs are paired, it's reachable, and
+  /// it isn't parked behind a pending TOFU identity mismatch (which the user
+  /// must Trust first). Drives the menu's Mac-row enablement and tooltip.
+  func isSwitchable(_ device: NetworkDevice) -> Bool {
+    PairingStore.shared.isPaired && device.pendingFingerprint == nil && isReachable(device.id)
+  }
+
+  /// Repeating background probe — runs every `reachabilityInterval` for the
+  /// life of the app, independent of whether the menu is ever opened.
+  private func startReachabilityPolling() {
+    let timer = DispatchSource.makeTimerSource(queue: .main)
+    // First fire soon after launch so an online peer is confirmed quickly
+    // (it starts greyed under the pessimistic default); then settle into the
+    // steady interval.
+    timer.schedule(
+      deadline: .now() + 1, repeating: Self.reachabilityInterval, leeway: .seconds(5))
+    timer.setEventHandler { [weak self] in self?.pollReachability() }
+    timer.resume()
+    reachabilityTimer = timer
+  }
+
+  /// Kick an immediate probe — called when the menu opens so the *next* render
+  /// is fresh (the probe is async and can't update an already-built menu). The
+  /// background timer keeps running on its own cadence regardless.
+  func refreshReachability() { pollReachability() }
+
+  private func pollReachability() {
+    // The probe rides the secure channel, so it's meaningless unpaired — skip
+    // (leaving the pessimistic default) rather than spam `.notPaired` failures.
+    // Skip mismatched peers too — a probe against a peer whose key genuinely
+    // differs would just auth-fail and feed its inbound rate limiter — EXCEPT
+    // when the pending fingerprint is exactly our current key's: then the probe
+    // authenticates (we hold the very key being advertised), and its handshake
+    // is what lets both sides self-heal the stale mismatch a mutual re-pair
+    // leaves behind (see `resolvePendingFingerprint(provedByHandshake:)`).
+    // Without the exception, two Macs parked symmetrically would never
+    // initiate a connection in either direction and the "proves it over the
+    // secure channel" resolution could never actually fire.
+    expireStaleIntroducedDevices()
+    guard PairingStore.shared.isPaired else { return }
+    BLETransport.shared.rescan()
+    for device in networkDevices where isProbeEligible(device) {
+      probeReachability(of: device)
+    }
+    introduceToDiscoveredPeers()
+  }
+
+  /// The probe rule `pollReachability` explains: not parked behind an identity
+  /// mismatch, unless the pending fingerprint is this Mac's current key.
+  private func isProbeEligible(_ device: NetworkDevice) -> Bool {
+    device.pendingFingerprint == nil
+      || device.pendingFingerprint == PairingStore.shared.fingerprint
+  }
+
+  /// The one-sided self-heal: polling is driven by *registered* records, so
+  /// a Mac whose user never registered its peer dials nothing — and an IP
+  /// change on this side then never reaches the peer's registered record
+  /// (without Bonjour it points at the old address forever). When nothing is
+  /// registered here, keep the exchange alive from this side by introducing
+  /// to discovered peers that have proved the current pairing key; the
+  /// receiver's source-IP ingest does the healing. Registered setups skip
+  /// this — their poll already exchanges both ways. Same fingerprint gate as
+  /// `migrateRenamedPeerIfNeeded`: an impostor echoing our `fp` over
+  /// cleartext Bonjour earns only a failed handshake.
+  private func introduceToDiscoveredPeers() {
+    guard networkDevices.isEmpty,
+      let currentFingerprint = PairingStore.shared.fingerprint
+    else { return }
+    let localHosts = Self.localAddresses()
+    for device in discoveredNetworkDevices
+    where device.isActive
+      && device.fingerprint == currentFingerprint
+      && device.pendingFingerprint == nil
+      && !localHosts.contains(Self.normalizeHost(device.host))
+    {
+      executeIntroduce(over: routes(for: device), countsTowardRateLimit: false) {
+        [weak self] result in
+        DispatchQueue.main.async {
+          guard let self = self,
+            case .success(.peer(let identity, let proved, let route)) = result
+          else { return }
+          self.ingestIntroduction(identity, provedFingerprint: proved, over: route)
+        }
+      }
+    }
+  }
+
+  /// Entries with no live Bonjour presence get no goodbye; expire the ones
+  /// no exchange has refreshed so they don't read as "still on the air"
+  /// forever. The browser's view is the exemption ground truth — an entry
+  /// it still sees advertised dies by goodbye, not by TTL.
+  private func expireStaleIntroducedDevices() {
+    let cutoff = Date().addingTimeInterval(-Self.introducedDeviceTTL)
+    for index in discoveredNetworkDevices.indices
+    where discoveredNetworkDevices[index].isActive
+      && discoveredNetworkDevices[index].lastUpdated < cutoff
+      && !serviceBrowser.isCurrentlyBrowsed(discoveredNetworkDevices[index].id)
+    {
+      discoveredNetworkDevices[index].isActive = false
+    }
+  }
+
+  /// One reachability probe against `device`: updates `deviceReachability`
+  /// (which greys the menu/Macs-tab rows) and advances the
+  /// `consecutivePollFailures` streak that triggers peer-vanished adoption.
+  /// The probe is an INTRODUCE, so every successful poll also refreshes the
+  /// peer's endpoint on both ends — the app's only routing source when
+  /// Bonjour advertising is unavailable.
+  /// `countsTowardRateLimit: false` keeps these fixed-cadence probes from
+  /// tripping our own outbound limiter. Factored out of `pollReachability` so a
+  /// single device can be re-probed off-cycle — by the fast confirming recheck
+  /// below, and by a Bonjour withdraw — without waiting out the 30s interval.
+  /// Bluetooth is tried too once the network fails, or once it has had
+  /// `bluetoothProbeHeadStart` if the last probe didn't get through on it, and
+  /// counts only if the network fails. A peer known only over Bluetooth isn't
+  /// probed until a scan identifies it.
+  private func probeReachability(of device: NetworkDevice) {
+    let network = Self.networkRoutes(to: device)
+    let bluetooth = bluetoothRoutes(to: device)
+    if network.isEmpty, bluetooth.isEmpty, BLETransport.shared.mayReachPeers {
+      return
+    }
+    var overNetwork: Bool? = network.isEmpty ? false : nil
+    var overBluetooth: Bool? = bluetooth.isEmpty ? false : nil
+    var bluetoothStarted = bluetooth.isEmpty
+    var settled = false
+
+    func settleIfDone() {
+      guard !settled, let overNetwork = overNetwork, overNetwork || overBluetooth != nil else {
+        return
+      }
+      settled = true
+      let viaBluetooth = !overNetwork && overBluetooth == true
+      recordProbe(of: device, reachable: overNetwork || viaBluetooth, overBluetooth: viaBluetooth)
+    }
+    func introduce(over routes: [PeerRoute], completion: @escaping (Bool) -> Void) {
+      executeIntroduce(over: routes, countsTowardRateLimit: false) { [weak self] result in
+        DispatchQueue.main.async {
+          guard let self = self else { return }
+          if case .success(.peer(let identity, let proved, let route)) = result {
+            self.ingestIntroduction(identity, provedFingerprint: proved, over: route)
+          }
+          // `.legacy` and `.unavailable` still count: the handshake completed.
+          if case .success = result { completion(true) } else { completion(false) }
+        }
+      }
+    }
+    func startBluetooth() {
+      guard !bluetoothStarted else { return }
+      bluetoothStarted = true
+      introduce(over: bluetooth) { reached in
+        overBluetooth = reached && BLETransport.shared.isEnabled
+        settleIfDone()
+      }
+    }
+
+    if network.isEmpty {
+      startBluetooth()
+    } else {
+      introduce(over: network) { reached in
+        overNetwork = reached
+        if !reached { startBluetooth() }
+        settleIfDone()
+      }
+      if !isReachable(device.id) || reachedOverBluetooth.contains(device.id) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.bluetoothProbeHeadStart) {
+          if overNetwork == nil { startBluetooth() }
+        }
+      }
+    }
+    settleIfDone()
+  }
+
+  /// Applies one probe's verdict to `device`'s reachability and failure streak,
+  /// unless the record was removed or renamed meanwhile.
+  private func recordProbe(of device: NetworkDevice, reachable: Bool, overBluetooth: Bool) {
+    guard networkDevices.contains(where: { $0.id == device.id }) else { return }
+    // Publish only on change — a steady-state poll would otherwise fire
+    // objectWillChange every interval and needlessly re-render observers.
+    if deviceReachability[device.id] != reachable {
+      deviceReachability[device.id] = reachable
+    }
+    setReachedOverBluetooth(overBluetooth, for: device.id)
+    if reachable {
+      consecutivePollFailures[device.id] = 0
+    } else {
+      let failures = (consecutivePollFailures[device.id] ?? 0) + 1
+      consecutivePollFailures[device.id] = failures
+      if failures == 1 {
+        // First miss of a new outage. The peer may have just left (slept,
+        // unplugged, quit); confirm with one quick re-probe rather than
+        // waiting a full ~30s interval for the next scheduled poll. A
+        // one-off dropped packet is cleared when the confirm succeeds and
+        // resets the streak. This is what makes a peer that vanishes *while
+        // this Mac is already awake* get its peripherals adopted within
+        // seconds instead of ~a minute — the wake path already covers the
+        // case where this Mac was itself asleep.
+        scheduleFastReachabilityRecheck(of: device)
+      } else if failures == 2 {
+        // Second consecutive miss: the peer has genuinely gone away, and
+        // whatever it was holding is stranded — let the adoption watcher
+        // pick it up. Exactly-two (not ≥) fires once per outage, so a
+        // long-dark peer doesn't re-arm the watcher every poll forever;
+        // a recovery resets the streak and re-arms it for the next one.
+        BluetoothPeripheralStore.shared.armAdoptionOfUnheldPeripherals()
+        if device.networkRoute != nil, device.port != Int(ServicePublisher.defaultPort) {
+          probeDefaultPortFallback(of: device)
+        }
+      }
+    }
+  }
+
+  /// A peer that fell back to an ephemeral port (its fixed port was taken
+  /// at launch) binds 41952 again after a relaunch — and with Bonjour
+  /// blocked, nothing else ever re-learns the move, stranding the
+  /// registered record on the dead ephemeral port. Once per confirmed
+  /// outage, try the fixed port; a success re-ingests the fresh endpoint
+  /// through the normal pipeline.
+  private func probeDefaultPortFallback(of device: NetworkDevice) {
+    let candidate = NetworkDevice(
+      id: device.id,
+      name: device.name,
+      host: device.host,
+      port: Int(ServicePublisher.defaultPort),
+      isActive: true,
+      fingerprint: device.fingerprint
+    )
+    executeIntroduce(over: Self.networkRoutes(to: candidate), countsTowardRateLimit: false) {
+      [weak self] result in
+      DispatchQueue.main.async {
+        guard let self = self,
+          case .success(.peer(let identity, let proved, let route)) = result
+        else { return }
+        self.ingestIntroduction(identity, provedFingerprint: proved, over: route)
+        self.deviceReachability[device.id] = true
+        self.consecutivePollFailures[device.id] = 0
+      }
+    }
+  }
+
+  /// Schedule a single off-cycle reachability re-probe of `device` a few
+  /// seconds out, to *confirm* a first missed poll (or a Bonjour withdraw)
+  /// quickly. Deduplicated per device so overlapping triggers don't stack
+  /// rechecks; the probe's own failure counting decides whether to arm
+  /// adoption. Runs on main.
+  private func scheduleFastReachabilityRecheck(of device: NetworkDevice) {
+    guard !pendingFastRecheck.contains(device.id) else { return }
+    pendingFastRecheck.insert(device.id)
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.fastRecheckDelay) { [weak self] in
+      guard let self = self else { return }
+      self.pendingFastRecheck.remove(device.id)
+      // Re-probe only if it's still a registered, paired peer that the poll
+      // itself would probe (not mismatched — or pending exactly our current
+      // key, the self-heal exception in `pollReachability`).
+      guard PairingStore.shared.isPaired,
+        let current = self.networkDevices.first(where: {
+          $0.id == device.id && self.isProbeEligible($0)
+        })
+      else { return }
+      self.probeReachability(of: current)
+    }
+  }
+
+  func sendNotification(
+    to device: NetworkDevice,
+    completion: ((Result<Void, OutgoingFailure>) -> Void)? = nil
+  ) {
+    guard PairingStore.shared.isPaired else {
+      completion?(.failure(.notPaired))
+      return
+    }
+
+    beginOperation(.ping, for: device.id)
+    let senderName = Host.current().localizedName ?? String(localized: "another Mac")
+    let finish: (Result<Void, OutgoingFailure>) -> Void = { [weak self] result in
+      DispatchQueue.main.async {
+        self?.endOperation(for: device.id)
+        completion?(result)
+      }
+    }
+    sendTwoFrameCommand(.pingNotification, payload: senderName, to: device) { [weak self] result in
+      guard let self = self, case .failure(.remoteOperationFailed) = result else {
+        finish(result)
+        return
+      }
+      // An older peer splits the legacy frame on its first `|`.
+      let legacyName = senderName.replacingOccurrences(of: "|", with: "/")
+      self.sendNotificationOverSecure(
+        to: device,
+        title: String(localized: "Ping from \(legacyName)"),
+        message: String(localized: "Test message received. Both Macs can reach each other."),
+        completion: finish)
+    }
+  }
+
+  // MARK: - In-Flight Operation Tracking
+
+  /// Marks a Macs-tab operation as running for `deviceID`. Main-thread only.
+  private func beginOperation(_ op: DeviceOperation, for deviceID: String) {
+    inFlightOperations[deviceID] = op
+  }
+
+  /// Clears the in-flight marker for `deviceID`. Main-thread only.
+  private func endOperation(for deviceID: String) {
+    inFlightOperations.removeValue(forKey: deviceID)
+  }
+
+  // MARK: - Private Methods
+
+  /// This Mac's active IPv4/IPv6 interface addresses, used by
+  /// `availableNetworkDevices` to recognise its own advertised service in
+  /// discovery results (robust to an mDNS rename of a duplicate device name).
+  /// Recomputed each call — `getifaddrs` is cheap and interface addresses
+  /// change (Wi-Fi reconnect, VPN, sleep/wake).
+  private static func localAddresses() -> Set<String> {
+    var result: Set<String> = []
+    var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddrPtr) == 0 else { return result }
+    defer { freeifaddrs(ifaddrPtr) }
+    var cursor = ifaddrPtr
+    while let current = cursor {
+      defer { cursor = current.pointee.ifa_next }
+      guard let sa = current.pointee.ifa_addr else { continue }
+      let family = sa.pointee.sa_family
+      guard family == sa_family_t(AF_INET) || family == sa_family_t(AF_INET6) else { continue }
+      var hostBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+      let status = getnameinfo(
+        sa, socklen_t(sa.pointee.sa_len),
+        &hostBuffer, socklen_t(hostBuffer.count),
+        nil, 0, NI_NUMERICHOST)
+      guard status == 0 else { continue }
+      result.insert(Self.normalizeHost(String(cString: hostBuffer)))
+    }
+    return result
+  }
+
+  /// Drop an IPv6 zone id (`fe80::1%en0` → `fe80::1`) so addresses compare
+  /// equal regardless of how the scope is formatted on each side.
+  private static func normalizeHost(_ host: String) -> String {
+    guard let pct = host.firstIndex(of: "%") else { return host }
+    return String(host[..<pct])
+  }
+
+  private func saveNetworkDevices() {
+    do {
+      let encoded = try JSONEncoder().encode(networkDevices)
+      networkDevicesData = encoded
+    } catch {
+      Log.network.error("Failed to save devices: \(error)")
+    }
+  }
+
+  private func loadNetworkDevices() {
+    do {
+      networkDevices = try JSONDecoder().decode([NetworkDevice].self, from: networkDevicesData)
+    } catch {
+      Log.network.error("Failed to load devices: \(error)")
+    }
+  }
+
+}
+
+/// Failure surface of `addPeerManually`, rendered inline in the Add by
+/// Address sheet.
+enum ManualAddError: Error {
+  case selfDial
+  case sameName(String)
+  case legacyPeer
+  case anotherMacRegistered(String)
+  case listenerNotReady
+  case peerNotReady
+  case outgoing(OutgoingFailure)
+
+  var userMessage: String {
+    switch self {
+    case .selfDial:
+      return String(localized: "That address is this Mac.")
+    case .sameName(let name):
+      return String(
+        localized:
+          "That Mac has the same name as this one (\(name)). Rename one of them in System Settings → General → About, then try again."
+      )
+    case .legacyPeer:
+      return
+        String(
+          localized:
+            "The other Mac runs an older version of Magic Switch that can't be added by address. Update it first."
+        )
+    case .anotherMacRegistered(let name):
+      return String(
+        localized: "Magic Switch works with one other Mac at a time. Remove \(name) first.")
+    case .listenerNotReady:
+      return OutgoingFailure.listenerNotReady.userMessage
+    case .peerNotReady:
+      return String(
+        localized: "The other Mac isn't ready to be added yet. Try again in a moment.")
+    case .outgoing(.connectTimeout), .outgoing(.connectionFailed(_)),
+      .outgoing(.handshakeFailed(.handshakeTimeout)),
+      .outgoing(.handshakeFailed(.connectionClosed)),
+      .outgoing(.handshakeFailed(.sendFailed(_))),
+      .outgoing(.handshakeFailed(.framingFailed)),
+      .outgoing(.handshakeFailed(.frameTooLarge)):
+      // An unpaired peer refuses the connection before the handshake, so it
+      // is indistinguishable here from a firewall drop, a dead host, or a
+      // different service answering on the port.
+      return
+        String(
+          localized:
+            "Couldn't reach the other Mac securely. Check that it's running Magic Switch and paired with the same code (Settings → Pairing), and that no firewall is blocking the port."
+        )
+    case .outgoing(let failure):
+      return failure.userMessage
+    }
+  }
+}
+
+/// Represents different types of device commands
+enum DeviceCommand: String, Codable {
+  case unregisterAll = "UNREGISTER_ALL"
+  case connectAll = "CONNECT_ALL"
+  case operationSuccess = "OP_SUCCESS"
+  case operationFailed = "OP_FAILED"
+  case notification = "NOTIFICATION"
+  case syncPeripherals = "SYNC_PERIPHERALS"
+  /// Two-frame: opcode then a single peripheral's MAC address. The peer
+  /// releases just that peripheral (used by per-peripheral switch flows).
+  case unregisterOne = "UNREGISTER_ONE"
+  /// Two-frame: opcode then a single peripheral's MAC address. The peer
+  /// connects just that peripheral.
+  case connectOne = "CONNECT_ONE"
+  /// Two-frame: opcode then a single peripheral's MAC address. The peer acks
+  /// `OP_SUCCESS` if it currently holds (has a live Bluetooth connection to)
+  /// that peripheral, `OP_FAILED` otherwise. Read-only — used by the
+  /// wake-time reclaim to avoid grabbing a peripheral the peer is actively
+  /// using.
+  case holdsOne = "HOLDS_ONE"
+  /// Single-frame no-op the peer immediately acks. Used as a secure-channel
+  /// health check and preflight: a successful handshake and OP_SUCCESS reply
+  /// prove the peer's app can accept commands. Lets the switch action bail
+  /// out before touching local Bluetooth state if the peer can't actually
+  /// take a command right now.
+  case ping = "PING"
+  /// Two-frame: opcode then a comma-separated list of MAC addresses the
+  /// *sender* just released as it goes to sleep. The receiver acks on receipt
+  /// (like `UNREGISTER_ALL`, not after pairing — the sleeping sender can't wait
+  /// that long) and then takes those peripherals. A proactive handoff, so a
+  /// peripheral lands on the awake Mac immediately instead of waiting for the
+  /// sleeping peer to be detected gone. Best-effort: the sender has already
+  /// released locally, so a dropped push just falls back to reactive adoption.
+  case adoptReleased = "ADOPT_RELEASED"
+  /// Two-frame: opcode then the sender's identity (`<listenPort>|<name>`).
+  /// The receiver learns the sender's routing (source IP + stated listen
+  /// port) over the authenticated channel and replies with its *own*
+  /// identity instead of OP_SUCCESS; legacy builds reply OP_FAILED, which
+  /// still proves the handshake. Keeps endpoints fresh without Bonjour.
+  case introduce = "INTRODUCE"
+  /// Reply to `INTRODUCE` from a current peer whose listener isn't bound yet,
+  /// so it has no identity to send. Distinct from the `OP_FAILED` an older
+  /// peer returns for the opcode it doesn't know.
+  case introduceUnavailable = "INTRODUCE_UNAVAILABLE"
+  /// Two-frame: opcode then the sender's computer name. The receiver composes
+  /// the ping notification itself, in its own language. Older peers answer
+  /// `OP_FAILED` and get the finished text as a `NOTIFICATION` instead.
+  case pingNotification = "PING_NOTIFICATION"
+}
+
+/// Decodes the standard OP_SUCCESS/OP_FAILED acknowledgement used by normal
+/// commands. A valid failure acknowledgement proves the authenticated channel
+/// stayed healthy; malformed or command-shaped replies are protocol errors.
+private func decodeOperationResponse(_ data: Data) -> Result<Void, OutgoingFailure> {
+  guard let response = String(data: data, encoding: .utf8),
+    let command = DeviceCommand(rawValue: response)
+  else {
+    return .failure(.invalidResponse)
+  }
+  switch command {
+  case .operationSuccess:
+    return .success(())
+  case .operationFailed:
+    return .failure(.remoteOperationFailed)
+  default:
+    return .failure(.invalidResponse)
+  }
+}
+
+/// Identity carried by `INTRODUCE` frames: `<listenPort>|<name>`, port first
+/// so the name may contain `|`.
+struct IntroducedIdentity {
+  let name: String
+  let port: UInt16
+
+  var encoded: String { "\(port)|\(name)" }
+
+  init(name: String, port: UInt16) {
+    // Mirror `init?(payload:)`'s rules so `encoded` always round-trips: when
+    // Bonjour never published, the raw computer name is bound by neither the
+    // 63-byte limit nor any character rules, and a peer that rejects the
+    // payload is indistinguishable from a legacy build.
+    var name = name.components(separatedBy: .controlCharacters).joined()
+      .trimmingCharacters(in: .whitespaces)
+    while name.utf8.count > 63 { name.removeLast() }
+    // Truncation can leave interior whitespace trailing, which the receiver
+    // trims — re-trim so both sides hold the identical name.
+    name = name.trimmingCharacters(in: .whitespaces)
+    self.name = name.isEmpty ? "Unknown" : name
+    self.port = port
+  }
+
+  init?(payload: String) {
+    let parts = payload.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+    guard parts.count == 2, let port = UInt16(parts[0]), port > 0 else { return nil }
+    let name = String(parts[1]).trimmingCharacters(in: .whitespaces)
+    // 63 bytes is Bonjour's instance-name limit; introduced ids key the same
+    // store entries as advertised ones.
+    guard !name.isEmpty, name.utf8.count <= 63,
+      name.rangeOfCharacter(from: .controlCharacters) == nil
+    else { return nil }
+    self.name = name
+    self.port = port
+  }
+}
+
+// MARK: - Health Check Extension
+
+extension NetworkDeviceStore {
+  /// Performs a health check on the specified device
+  func performHealthCheck(
+    for device: NetworkDevice, completion: @escaping (HealthCheckResult) -> Void
+  ) {
+    device.checkHealth { result in
+      DispatchQueue.main.async {
+        switch result {
+        case .success:
+          Log.network.debug("Health check successful with \(device.name)")
+          completion(result)
+        case .failure(let error):
+          Log.network.debug("Health check failed with \(device.name): \(error)")
+          completion(result)
+        case .timeout:
+          Log.network.debug("Health check timed out with \(device.name)")
+          completion(result)
+        }
+      }
+    }
+  }
+
+  /// Executes a command on `device` through a secure channel. The caller
+  /// must pick the target device — keeping this explicit matches the per-
+  /// peripheral senders (`executeUnregisterOne` / `executeConnectOne`) and
+  /// avoids burying the single-device assumption inside this function.
+  func executeCommand(
+    _ command: DeviceCommand,
+    on device: NetworkDevice,
+    countsTowardRateLimit: Bool = true,
+    completion: @escaping (Result<Void, OutgoingFailure>) -> Void
+  ) {
+    executeCommand(
+      command, over: routes(for: device), to: device,
+      countsTowardRateLimit: countsTowardRateLimit, completion: completion)
+  }
+
+  private func executeCommand(
+    _ command: DeviceCommand,
+    over routes: [PeerRoute],
+    to device: NetworkDevice? = nil,
+    countsTowardRateLimit: Bool = true,
+    completion: @escaping (Result<Void, OutgoingFailure>) -> Void
+  ) {
+    guard PairingStore.shared.isPaired else {
+      completion(.failure(.notPaired))
+      return
+    }
+
+    let bodyTimeout: TimeInterval
+    switch command {
+    case .connectAll: bodyTimeout = Self.handoffBodyTimeout
+    case .unregisterAll: bodyTimeout = Self.releaseBodyTimeout
+    default: bodyTimeout = 5
+    }
+    let outgoing = OutgoingConnection(
+      routes: routes,
+      countsTowardRateLimit: countsTowardRateLimit,
+      bodyTimeout: bodyTimeout
+    )
+    outgoing.run(
+      body: { channel, done in
+        channel.send(Data(command.rawValue.utf8)) { sendErr in
+          if let sendErr = sendErr {
+            Log.network.error("Failed to send command: \(sendErr)")
+            done(.failure(.bodyFailed))
+            return
+          }
+          channel.receive { result in
+            switch result {
+            case .failure(let err):
+              Log.network.error("Failed to receive response: \(err)")
+              done(.failure(.bodyFailed))
+            case .success(let data):
+              done(decodeOperationResponse(data))
+            }
+          }
+        }
+      },
+      completion: orderingRoutes(of: device, by: outgoing, then: completion)
+    )
+  }
+
+  /// Sends a notification through a secure channel.
+  func sendNotificationOverSecure(
+    to device: NetworkDevice,
+    title: String,
+    message: String,
+    completion: @escaping (Result<Void, OutgoingFailure>) -> Void
+  ) {
+    guard PairingStore.shared.isPaired else {
+      completion(.failure(.notPaired))
+      return
+    }
+
+    let outgoing = OutgoingConnection(routes: routes(for: device))
+    outgoing.run(
+      body: { channel, done in
+        channel.send(Data(DeviceCommand.notification.rawValue.utf8)) { err in
+          if let err = err {
+            Log.network.error("Notification command send failed: \(err)")
+            done(.failure(.bodyFailed))
+            return
+          }
+          let payload = "\(title)|\(message)"
+          channel.send(Data(payload.utf8)) { err2 in
+            if let err2 = err2 {
+              Log.network.error("Notification payload send failed: \(err2)")
+              done(.failure(.bodyFailed))
+              return
+            }
+            // Wait for the receiver's OP_SUCCESS/OP_FAILED before tearing
+            // down. `NWConnection.send(.contentProcessed)` only confirms
+            // local buffering, and the subsequent cancel() can drop frames
+            // still in flight — without an ack, the peer often never sees
+            // the payload.
+            channel.receive { result in
+              switch result {
+              case .failure(let err):
+                Log.network.error("Notification ack receive failed: \(err)")
+                done(.failure(.bodyFailed))
+              case .success(let data):
+                done(decodeOperationResponse(data))
+              }
+            }
+          }
+        }
+      },
+      completion: orderingRoutes(of: device, by: outgoing, then: completion)
+    )
+  }
+}
+
+extension NetworkDeviceStore {
+  /// Push this Mac's registered peripheral list to `device`. Completion
+  /// receives the categorised outgoing result so the caller can render
+  /// inline UI feedback (the Macs tab does this under each row). The
+  /// store no longer surfaces its own notifications for sync — callers
+  /// decide how to report success/failure.
+  func sendPeripheralSync(
+    peripherals: [BluetoothPeripheral],
+    to device: NetworkDevice,
+    completion: ((Result<Void, OutgoingFailure>) -> Void)? = nil
+  ) {
+    guard PairingStore.shared.isPaired else {
+      completion?(.failure(.notPaired))
+      return
+    }
+
+    guard let data = try? JSONEncoder().encode(peripherals),
+      let jsonString = String(data: data, encoding: .utf8)
+    else {
+      Log.network.error("sendPeripheralSync: failed to encode peripherals")
+      completion?(.failure(.encodingFailed))
+      return
+    }
+
+    beginOperation(.sync(count: peripherals.count), for: device.id)
+    let outgoing = OutgoingConnection(routes: routes(for: device))
+    outgoing.run(
+      body: { channel, done in
+        channel.send(Data(DeviceCommand.syncPeripherals.rawValue.utf8)) { err in
+          if let err = err {
+            Log.network.error("syncPeripherals command send failed: \(err)")
+            done(.failure(.bodyFailed))
+            return
+          }
+          channel.send(Data(jsonString.utf8)) { err2 in
+            if let err2 = err2 {
+              Log.network.error("syncPeripherals payload send failed: \(err2)")
+              done(.failure(.bodyFailed))
+              return
+            }
+            // Same rationale as the notification path: wait for the
+            // receiver's OP_SUCCESS so we don't cancel() before the peer
+            // actually processes the payload.
+            channel.receive { result in
+              switch result {
+              case .failure(let err):
+                Log.network.error("syncPeripherals ack receive failed: \(err)")
+                done(.failure(.bodyFailed))
+              case .success(let data):
+                done(decodeOperationResponse(data))
+              }
+            }
+          }
+        }
+      },
+      completion: orderingRoutes(of: device, by: outgoing) { [weak self] result in
+        DispatchQueue.main.async {
+          self?.endOperation(for: device.id)
+          completion?(result)
+        }
+      }
+    )
+  }
+
+  // MARK: - Per-Peripheral Switch Opcodes
+
+  /// Asks `device` to release the peripheral with the given MAC address.
+  /// Two-frame protocol: opcode + MAC, then OP_SUCCESS/OP_FAILED.
+  func executeUnregisterOne(
+    address: String,
+    on device: NetworkDevice,
+    completion: @escaping (Result<Void, OutgoingFailure>) -> Void
+  ) {
+    sendTwoFrameCommand(.unregisterOne, payload: address, to: device, completion: completion)
+  }
+
+  /// Asks `device` to take ownership of the peripheral with the given MAC
+  /// address. Two-frame protocol mirroring `executeUnregisterOne`.
+  func executeConnectOne(
+    address: String,
+    on device: NetworkDevice,
+    completion: @escaping (Result<Void, OutgoingFailure>) -> Void
+  ) {
+    sendTwoFrameCommand(.connectOne, payload: address, to: device, completion: completion)
+  }
+
+  /// Asks `device` whether it currently holds the peripheral with the given
+  /// MAC. `.success` means the peer holds it (so leave it alone); any
+  /// `.failure` — an explicit "no" or an unreachable peer — means it's free
+  /// for us to reclaim. Two-frame protocol mirroring `executeUnregisterOne`.
+  func executeHoldsOne(
+    address: String,
+    on device: NetworkDevice,
+    completion: @escaping (Result<Void, OutgoingFailure>) -> Void
+  ) {
+    // `HOLDS_ONE` is only ever a background watcher/reclaim probe, never a user
+    // action — opt out of the outbound limiter so its fixed cadence can't trip
+    // the limiter that gates real switches (mirrors the reachability poll).
+    sendTwoFrameCommand(
+      .holdsOne, payload: address, to: device, countsTowardRateLimit: false,
+      completion: completion)
+  }
+
+  /// Tells `device` to take the peripherals the sender just released on its way
+  /// to sleep — the proactive handoff `prepareForSleep` fires. The peer acks on
+  /// receipt, so the sleeping sender only has to wait a moment before sleeping.
+  /// `countsTowardRateLimit: false` — this is a system-triggered push, not a
+  /// user action, and shouldn't feed the limiter that gates real switches.
+  func executeAdoptReleased(
+    addresses: [String],
+    on device: NetworkDevice,
+    completion: @escaping (Result<Void, OutgoingFailure>) -> Void
+  ) {
+    sendTwoFrameCommand(
+      .adoptReleased, payload: addresses.joined(separator: ","), to: device,
+      countsTowardRateLimit: false, completion: completion)
+  }
+
+  /// The peer's answer to an INTRODUCE: its identity, the fingerprint of the
+  /// key the channel proved, and the route that carried it — or `legacy` from
+  /// a build that predates the opcode (it replied OP_FAILED — still a completed
+  /// handshake).
+  enum IntroduceReply {
+    case peer(IntroducedIdentity, provedFingerprint: String, route: PeerRoute)
+    case legacy
+    case unavailable
+  }
+
+  /// Exchanges identities with the peer at `routes` over the secure channel.
+  /// Doubles as the reachability probe: unlike `.ping`, each successful
+  /// exchange also refreshes routing on both ends, with or without Bonjour.
+  func executeIntroduce(
+    over routes: [PeerRoute],
+    countsTowardRateLimit: Bool = true,
+    completion: @escaping (Result<IntroduceReply, OutgoingFailure>) -> Void
+  ) {
+    guard PairingStore.shared.isPaired else {
+      completion(.failure(.notPaired))
+      return
+    }
+    guard let local = servicePublisher.currentIdentity() else {
+      completion(.failure(.listenerNotReady))
+      return
+    }
+    let outgoing = OutgoingConnection(
+      routes: routes, countsTowardRateLimit: countsTowardRateLimit)
+    var reply: IntroduceReply?
+    outgoing.run(
+      body: { channel, done in
+        channel.send(Data(DeviceCommand.introduce.rawValue.utf8)) { err in
+          if let err = err {
+            Log.network.error("INTRODUCE command send failed: \(err)")
+            done(.failure(.bodyFailed))
+            return
+          }
+          channel.send(Data(local.encoded.utf8)) { err2 in
+            if let err2 = err2 {
+              Log.network.error("INTRODUCE payload send failed: \(err2)")
+              done(.failure(.bodyFailed))
+              return
+            }
+            channel.receive { result in
+              switch result {
+              case .failure(let err):
+                Log.network.error("INTRODUCE reply receive failed: \(err)")
+                done(.failure(.bodyFailed))
+              case .success(let data):
+                let response = String(data: data, encoding: .utf8) ?? ""
+                if let identity = IntroducedIdentity(payload: response),
+                  let proved = outgoing.provedFingerprint, let route = outgoing.route
+                {
+                  reply = .peer(identity, provedFingerprint: proved, route: route)
+                  done(.success(()))
+                } else if DeviceCommand(rawValue: response) == .operationFailed {
+                  reply = .legacy
+                  done(.success(()))
+                } else if DeviceCommand(rawValue: response) == .introduceUnavailable {
+                  reply = .unavailable
+                  done(.success(()))
+                } else {
+                  done(.failure(.invalidResponse))
+                }
+              }
+            }
+          }
+        }
+      },
+      completion: { result in
+        switch result {
+        case .success:
+          completion(reply.map { .success($0) } ?? .failure(.bodyFailed))
+        case .failure(let err):
+          completion(.failure(err))
+        }
+      }
+    )
+  }
+
+  /// Registers a peer from just a dialable endpoint — the bootstrap for
+  /// networks where Bonjour can't carry advertisements in either direction.
+  /// The INTRODUCE reply supplies the name, and the exchange lands this Mac
+  /// in the peer's discovered list, so only one side ever needs to do this.
+  func addPeerManually(
+    host: String, port: UInt16,
+    completion: @escaping (Result<NetworkDevice, ManualAddError>) -> Void
+  ) {
+    // Without a bound listener there's no local identity to INTRODUCE with;
+    // `executeIntroduce` would report it as a peer-shaped connection failure.
+    guard servicePublisher.currentIdentity() != nil else {
+      completion(.failure(.listenerNotReady))
+      return
+    }
+    executeIntroduce(over: [.network(host: host, port: port)]) { [weak self] result in
+      DispatchQueue.main.async {
+        guard let self = self else { return }
+        switch result {
+        case .failure(let failure):
+          completion(.failure(.outgoing(failure)))
+        case .success(.legacy):
+          completion(.failure(.legacyPeer))
+        case .success(.unavailable):
+          completion(.failure(.peerNotReady))
+        case .success(.peer(let identity, let proved, _)):
+          // The handshake happily completes against our own listener (same
+          // key, both roles), and `registerNetworkDevice` has no self-guard.
+          guard !Self.localAddresses().contains(Self.normalizeHost(host)) else {
+            completion(.failure(.selfDial))
+            return
+          }
+          // Records are keyed by name, so a peer with this Mac's own name
+          // would fight it over one entry (see `ingestIntroducedPeer`).
+          guard !self.isLocalName(identity.name) else {
+            completion(.failure(.sameName(identity.name)))
+            return
+          }
+          self.ingestIntroducedPeer(
+            name: identity.name, host: host, port: Int(identity.port),
+            provedFingerprint: proved)
+          if let registered = self.networkDevices.first(where: { $0.id == identity.name }) {
+            completion(.success(registered))
+          } else if let candidateID = self.renameCandidateID(forFingerprint: proved),
+            let index = self.networkDevices.firstIndex(where: { $0.id == candidateID })
+          {
+            // The handshake on this very connection is the proof the Bonjour
+            // path has to fetch with a ping first.
+            self.commitRenameMigration(
+              at: index,
+              to: NetworkDevice(
+                id: identity.name, name: identity.name, host: host, port: Int(identity.port)),
+              fingerprint: proved)
+            completion(.success(self.networkDevices[index]))
+          } else if let other = self.networkDevices.first {
+            completion(.failure(.anotherMacRegistered(other.name)))
+          } else {
+            // Register from the exchange itself, not the merged discovered
+            // entry — a parked entry from an earlier pairing would smuggle
+            // in its stale host while this very connection just proved the
+            // typed one.
+            let proven = NetworkDevice(
+              id: identity.name,
+              name: identity.name,
+              host: host,
+              port: Int(identity.port),
+              isActive: true,
+              fingerprint: proved
+            )
+            self.deviceReachability[identity.name] = true
+            self.consecutivePollFailures[identity.name] = 0
+            self.registerNetworkDevice(device: proven)
+            completion(.success(proven))
+          }
+        }
+      }
+    }
+  }
+
+  /// Shared helper for "opcode + single payload frame, await OP_SUCCESS".
+  /// Kept private to this extension; the older two-frame call sites
+  /// (`sendNotificationOverSecure`, `sendPeripheralSync`) still have their
+  /// own inline copies because their failure surfaces differ.
+  private func sendTwoFrameCommand(
+    _ command: DeviceCommand,
+    payload: String,
+    to device: NetworkDevice,
+    countsTowardRateLimit: Bool = true,
+    completion: @escaping (Result<Void, OutgoingFailure>) -> Void
+  ) {
+    guard PairingStore.shared.isPaired else {
+      completion(.failure(.notPaired))
+      return
+    }
+    let bodyTimeout: TimeInterval
+    switch command {
+    case .connectOne: bodyTimeout = Self.handoffBodyTimeout
+    case .unregisterOne: bodyTimeout = Self.releaseBodyTimeout
+    default: bodyTimeout = 5
+    }
+    let outgoing = OutgoingConnection(
+      routes: routes(for: device),
+      countsTowardRateLimit: countsTowardRateLimit,
+      bodyTimeout: bodyTimeout)
+    outgoing.run(
+      body: { channel, done in
+        channel.send(Data(command.rawValue.utf8)) { err in
+          if let err = err {
+            Log.network.error("\(command.rawValue) command send failed: \(err)")
+            done(.failure(.bodyFailed))
+            return
+          }
+          channel.send(Data(payload.utf8)) { err2 in
+            if let err2 = err2 {
+              Log.network.error("\(command.rawValue) payload send failed: \(err2)")
+              done(.failure(.bodyFailed))
+              return
+            }
+            channel.receive { result in
+              switch result {
+              case .failure(let err):
+                Log.network.error("\(command.rawValue) ack receive failed: \(err)")
+                done(.failure(.bodyFailed))
+              case .success(let data):
+                done(decodeOperationResponse(data))
+              }
+            }
+          }
+        }
+      },
+      completion: orderingRoutes(of: device, by: outgoing, then: completion)
+    )
+  }
+}
