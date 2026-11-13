@@ -1953,6 +1953,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     alert.addButton(withTitle: String(localized: "Done"))
 
     let codeLabel = NSTextField(labelWithString: code)
+    codeLabel.frame = NSRect(x: 0, y: 38, width: 240, height: 32)
     codeLabel.font = .monospacedDigitSystemFont(ofSize: 26, weight: .semibold)
     codeLabel.alignment = .center
     codeLabel.textColor = .labelColor
@@ -1960,30 +1961,35 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
 
     let status = NSTextField(
       labelWithString: String(localized: "The keyboard is waiting for the code."))
+    status.frame = NSRect(x: 8, y: 0, width: 224, height: 34)
     status.lineBreakMode = .byWordWrapping
     status.maximumNumberOfLines = 2
 
-    // Keep the accessory narrower than the alert's content area so the code
-    // and instructions remain visible on smaller displays and with larger
-    // accessibility text settings.
-    let accessory = NSStackView(views: [codeLabel, status])
-    accessory.orientation = .vertical
-    accessory.alignment = .centerX
-    accessory.spacing = 8
-    accessory.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 8, right: 12)
-    accessory.translatesAutoresizingMaskIntoConstraints = false
-    status.preferredMaxLayoutWidth = 280
-    NSLayoutConstraint.activate([
-      accessory.widthAnchor.constraint(equalToConstant: 304),
-      codeLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 280),
-      status.widthAnchor.constraint(equalToConstant: 280),
-    ])
+    // NSAlert does not reliably include an Auto Layout-only accessory view in
+    // its fitting-size calculation. Give it a concrete, compact frame and lay
+    // out the labels inside that frame so they cannot extend past the alert.
+    let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 76))
+    accessory.addSubview(codeLabel)
+    accessory.addSubview(status)
     alert.accessoryView = accessory
     keyboardPairingPromptStatuses[address] = status
     keyboardPairingPromptWindows[address] = alert.window
 
+    // NSAlert can be wider than the remaining visible area when its text wraps
+    // differently across displays. Center it on the main display and clamp its
+    // origin so the whole window stays on-screen.
+    let window = alert.window
+    if let screen = NSScreen.main ?? window.screen {
+      let visible = screen.visibleFrame.insetBy(dx: 12, dy: 12)
+      var frame = window.frame
+      frame.origin.x = visible.midX - frame.width / 2
+      frame.origin.y = visible.midY - frame.height / 2
+      frame.origin.x = min(max(frame.origin.x, visible.minX), visible.maxX - frame.width)
+      frame.origin.y = min(max(frame.origin.y, visible.minY), visible.maxY - frame.height)
+      window.setFrame(frame, display: false)
+    }
     NSApp.activate(ignoringOtherApps: true)
-    alert.window.makeKeyAndOrderFront(nil)
+    window.makeKeyAndOrderFront(nil)
     alert.runModal()
     if keyboardPairingPromptStatuses[address] === status {
       keyboardPairingPromptStatuses.removeValue(forKey: address)
