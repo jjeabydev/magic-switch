@@ -227,6 +227,7 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   /// Status labels shown in the keyboard PIN prompt while pairing completes.
   /// The Bluetooth pairing API reports the final result, not individual keys.
   private var keyboardPairingPromptStatuses: [String: NSTextField] = [:]
+  private var keyboardPairingPromptWindows: [String: NSWindow] = [:]
 
   /// The attempt token each pending pair was created under, maintained in
   /// lockstep with `pendingPairs`. The delegate must fail with the *pair's
@@ -1846,7 +1847,9 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
         if device.isConnected() {
           self.setConnectionState(.connected, for: address)
           self.setKeyboardPairingPromptStatus(
-            String(localized: "Connected. The pairing code was accepted."), for: address)
+            String(localized: "Connected. The pairing code was accepted."),
+            for: address,
+            dismissAfter: 3)
           self.registerForDisconnect(device: device, address: address)
         } else if let attempt {
           let name = device.resolvedName
@@ -1950,18 +1953,30 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     status.maximumNumberOfLines = 2
     alert.accessoryView = status
     keyboardPairingPromptStatuses[address] = status
+    keyboardPairingPromptWindows[address] = alert.window
 
     NSApp.activate(ignoringOtherApps: true)
     alert.runModal()
     if keyboardPairingPromptStatuses[address] === status {
       keyboardPairingPromptStatuses.removeValue(forKey: address)
     }
+    if keyboardPairingPromptWindows[address] === alert.window {
+      keyboardPairingPromptWindows.removeValue(forKey: address)
+    }
   }
 
-  private func setKeyboardPairingPromptStatus(_ message: String, for address: String) {
+  private func setKeyboardPairingPromptStatus(
+    _ message: String, for address: String, dismissAfter: TimeInterval? = nil
+  ) {
     let update: () -> Void = { [weak self] in
-      guard let status = self?.keyboardPairingPromptStatuses[address] else { return }
+      guard let self, let status = self.keyboardPairingPromptStatuses[address] else { return }
       status.stringValue = message
+      guard let dismissAfter else { return }
+      DispatchQueue.main.asyncAfter(deadline: .now() + dismissAfter) { [weak self] in
+        guard let self, let window = self.keyboardPairingPromptWindows[address], window.isVisible
+        else { return }
+        window.close()
+      }
     }
     if Thread.isMainThread {
       update()
