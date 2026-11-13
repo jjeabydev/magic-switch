@@ -1942,20 +1942,33 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
         localized: "Type this code on %@, then press Return on the keyboard."),
       deviceName)
     let noKeystrokeEcho = String(
-      localized: "The digits won't appear here; this window shows the pairing result.")
-    alert.informativeText = "\(instructions)\n\n\(code)\n\n\(noKeystrokeEcho)"
+      localized: "Typed digits won't appear here; this window shows the pairing result.")
+    alert.informativeText = "\(instructions)\n\n\(noKeystrokeEcho)"
     alert.alertStyle = .informational
     alert.addButton(withTitle: String(localized: "Done"))
+
+    let codeLabel = NSTextField(labelWithString: code)
+    codeLabel.font = .monospacedDigitSystemFont(ofSize: 34, weight: .semibold)
+    codeLabel.alignment = .center
+    codeLabel.textColor = .labelColor
+    codeLabel.setAccessibilityLabel(String(localized: "Bluetooth pairing code: \(code)"))
 
     let status = NSTextField(
       labelWithString: String(localized: "The keyboard is waiting for the code."))
     status.lineBreakMode = .byWordWrapping
     status.maximumNumberOfLines = 2
-    alert.accessoryView = status
+
+    let accessory = NSStackView(views: [codeLabel, status])
+    accessory.orientation = .vertical
+    accessory.alignment = .centerX
+    accessory.spacing = 8
+    accessory.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 8, right: 12)
+    alert.accessoryView = accessory
     keyboardPairingPromptStatuses[address] = status
     keyboardPairingPromptWindows[address] = alert.window
 
     NSApp.activate(ignoringOtherApps: true)
+    alert.window.makeKeyAndOrderFront(nil)
     alert.runModal()
     if keyboardPairingPromptStatuses[address] === status {
       keyboardPairingPromptStatuses.removeValue(forKey: address)
