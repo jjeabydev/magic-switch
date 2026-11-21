@@ -99,7 +99,7 @@ If the network won't let the Macs reach each other at all — a VPN that blocks 
 
 ### 4. Peripherals tab — choose what to manage
 
-Under **Available Peripherals**, click **+** beside each Magic device you want Magic Switch to hand back and forth; it moves up to **Registered Peripherals**. Each registered row has a **Send** or **Take** button that moves just that peripheral, like clicking it in the menu. Each row's leading icon shows the detected device type; click it to override the type or reset it to Automatic. Rows show a live battery level while the peripheral is connected to this Mac.
+Under **Available Peripherals**, click **+** beside each Magic device you want Magic Switch to hand back and forth; it moves up to **Registered Peripherals**. Each registered row has a **Send** or **Take** button that moves just that peripheral, like clicking it in the menu. Each row's leading icon shows the detected device type; click it to override the type or reset it to Automatic. Keyboard rows show a **6-digit code** checkbox for a wireless keyboard that needs a code typed on the keyboard. Rows show a live battery level while the peripheral is connected to this Mac.
 
 <p align="center">
   <img src="docs/assets/peripheral-tab.png" alt="Peripherals tab showing registered and available peripherals" width="600"><br>
@@ -108,7 +108,7 @@ Under **Available Peripherals**, click **+** beside each Magic device you want M
 
 <p align="center">
   <img src="docs/assets/peripheral-type-picker.png" alt="Peripherals tab with a row's type picker open" width="600"><br>
-<em>That leading icon is also a picker — Magic Switch auto-detects the type (keyboard, mouse, trackpad, headphones, AirPods, microphone), and you can override it or set it back to Automatic. Its menu also has **Use six-digit keyboard code** for a wireless keyboard whose code prompt isn't detected automatically.</em>
+<em>That leading icon is also a picker — Magic Switch auto-detects the type (keyboard, mouse, trackpad, headphones, AirPods, microphone), and you can override it or set it back to Automatic.</em>
 </p>
 
 ### 5. Sync your peripherals to the other Mac

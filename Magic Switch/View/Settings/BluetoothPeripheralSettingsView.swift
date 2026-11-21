@@ -221,6 +221,17 @@ private struct PeripheralRowView: View {
         Text(peripheral.name)
         statusLine
       }
+      if resolvedType == .keyboard || store.requiresManualKeyboardPIN(for: peripheral) {
+        Toggle(
+          "6-digit code",
+          isOn: Binding(
+            get: { store.requiresManualKeyboardPIN(for: peripheral) },
+            set: { store.setManualKeyboardPINRequired($0, for: peripheral.id) }))
+        .toggleStyle(.checkbox)
+        .font(.caption)
+        .fixedSize()
+        .help("Enable for a wireless keyboard that asks you to type a six-digit code.")
+      }
       Spacer()
       // Published store state, not a direct registry read: the level often
       // appears in the registry a beat after `.connected`, and only a
@@ -330,13 +341,6 @@ private struct PeripheralRowView: View {
           Label(type.label, systemImage: type.symbolName)
         }
       }
-      Divider()
-      Toggle(
-        "Use six-digit keyboard code",
-        isOn: Binding(
-          get: { store.requiresManualKeyboardPIN(for: peripheral) },
-          set: { store.setManualKeyboardPINRequired($0, for: peripheral.id) }))
-      .help("Enable for a wireless keyboard that asks you to type a six-digit code.")
     } label: {
       Image(nsImage: typeIcon)
     }
@@ -345,7 +349,7 @@ private struct PeripheralRowView: View {
     .frame(width: 44, alignment: .leading)
     .accessibilityLabel("Set the icon for \(peripheral.name)")
     .accessibilityValue(resolvedType.label)
-    .help("Set the icon or pairing-code option for \(peripheral.name).")
+    .help("Set the icon for \(peripheral.name). Choose Automatic to detect it from the device.")
   }
 
   private func actionLabel(_ title: String) -> some View {
