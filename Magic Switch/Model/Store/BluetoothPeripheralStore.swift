@@ -140,6 +140,9 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   /// `@AppStorage` key for the per-peripheral icon/type overrides map.
   static let typeOverridesDefaultsKey = "peripheralTypeOverrides"
 
+  /// `@AppStorage` key for devices explicitly configured to request a keyboard PIN.
+  static let keyboardPINOverridesDefaultsKey = "peripheralKeyboardPINOverrides"
+
   /// `@AppStorage` key for the last-known Class of Device per address.
   static let deviceClassesDefaultsKey = "peripheralDeviceClasses"
 
@@ -147,6 +150,9 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
 
   @AppStorage(BluetoothPeripheralStore.typeOverridesDefaultsKey)
   private var typeOverridesData: Data = Data()
+
+  @AppStorage(BluetoothPeripheralStore.keyboardPINOverridesDefaultsKey)
+  private var keyboardPINOverridesData: Data = Data()
 
   @AppStorage(BluetoothPeripheralStore.deviceClassesDefaultsKey)
   private var deviceClassesData: Data = Data()
@@ -180,6 +186,12 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   /// to this Mac (not synced — the peer auto-detects its own icons). Persisted.
   @Published private(set) var typeOverrides: [String: PeripheralType] = [:] {
     didSet { saveTypeOverrides() }
+  }
+
+  /// Per-device manual override for the six-digit keyboard pairing prompt.
+  /// `nil` falls back to Apple Wireless Keyboard name detection.
+  @Published private(set) var keyboardPINOverrides: [String: Bool] = [:] {
+    didSet { saveKeyboardPINOverrides() }
   }
 
   /// Bluetooth Class of Device per address, captured from the live paired
@@ -464,12 +476,35 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
   }
 
+  /// Whether pairing this device should show the six-digit code prompt.
+  /// Defaults to detecting Apple Wireless Keyboards by their reported name.
+  func requiresManualKeyboardPIN(for peripheral: BluetoothPeripheral) -> Bool {
+    if let override = keyboardPINOverrides[peripheral.id] { return override }
+    return Self.requiresManualKeyboardPIN(deviceName: peripheral.name)
+  }
+
+  /// Set a per-device override. Removing a redundant value restores automatic detection.
+  func setManualKeyboardPINRequired(_ required: Bool, for id: String) {
+    let apply: () -> Void = { [weak self] in
+      guard let self = self else { return }
+      let detected = Self.requiresManualKeyboardPIN(
+        deviceName: self.peripherals.first(where: { $0.id == id })?.name ?? "")
+      if required == detected {
+        self.keyboardPINOverrides.removeValue(forKey: id)
+      } else {
+        self.keyboardPINOverrides[id] = required
+      }
+    }
+    if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
+  }
+
   // MARK: - Initialization
 
   private override init() {
     super.init()
     loadPeripherals()
     loadTypeOverrides()
+    loadKeyboardPINOverrides()
     loadDeviceClasses()
     fetchConnectedPeripherals()
     registerForSystemBluetoothConnects()
@@ -2019,17 +2054,18 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     }
   }
 
-  /// Matches the legacy Apple Wireless Keyboard when macOS reports its model
-  /// name. The registered peripheral type is also checked below because the
-  /// reported name can be empty or customized.
+  /// Automatically matches the legacy Apple Wireless Keyboard when macOS
+  /// reports its model name. Renamed or unrecognized devices use the per-device
+  /// override exposed in the peripheral's type menu.
   static func requiresManualKeyboardPIN(deviceName: String) -> Bool {
     deviceName.localizedCaseInsensitiveContains("Apple Wireless Keyboard")
   }
 
   private func requiresManualKeyboardPIN(address: String, reportedName: String?) -> Bool {
+    if let override = keyboardPINOverrides[address] { return override }
     if let reportedName, Self.requiresManualKeyboardPIN(deviceName: reportedName) { return true }
     guard let peripheral = peripherals.first(where: { $0.id == address }) else { return false }
-    return peripheralType(for: peripheral) == .keyboard
+    return Self.requiresManualKeyboardPIN(deviceName: peripheral.name)
   }
 
   /// Only an explicit connect or handoff should ask the user to type on the
@@ -2953,6 +2989,24 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       typeOverridesData = try JSONEncoder().encode(typeOverrides)
     } catch {
       Log.bluetooth.error("Failed to save type overrides: \(error)")
+    }
+  }
+
+  private func saveKeyboardPINOverrides() {
+    do {
+      keyboardPINOverridesData = try JSONEncoder().encode(keyboardPINOverrides)
+    } catch {
+      Log.bluetooth.error("Failed to save keyboard PIN overrides: \(error)")
+    }
+  }
+
+  private func loadKeyboardPINOverrides() {
+    guard !keyboardPINOverridesData.isEmpty else { return }
+    do {
+      keyboardPINOverrides = try JSONDecoder().decode(
+        [String: Bool].self, from: keyboardPINOverridesData)
+    } catch {
+      Log.bluetooth.error("Failed to load keyboard PIN overrides: \(error)")
     }
   }
 

@@ -108,7 +108,7 @@ Under **Available Peripherals**, click **+** beside each Magic device you want M
 
 <p align="center">
   <img src="docs/assets/peripheral-type-picker.png" alt="Peripherals tab with a row's type picker open" width="600"><br>
-  <em>That leading icon is also a picker — Magic Switch auto-detects the type (keyboard, mouse, trackpad, headphones, AirPods, microphone), and you can override it or set it back to Automatic.</em>
+<em>That leading icon is also a picker — Magic Switch auto-detects the type (keyboard, mouse, trackpad, headphones, AirPods, microphone), and you can override it or set it back to Automatic. Its menu also has **Use six-digit keyboard code** for a wireless keyboard whose code prompt isn't detected automatically.</em>
 </p>
 
 ### 5. Sync your peripherals to the other Mac
